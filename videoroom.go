@@ -276,6 +276,7 @@ func (vr *Videoroom) newSession(jsip *rtclib.JSIP) (*session, bool) {
                      jsipRoom: jsip.To,
                      userName: jsip.From,
                      mutex: make(chan struct{}, 1),
+                     quit: make(chan struct{}),
                      feeds: make(map[string](*feed)),}
     vr.sess = sess
     vr.setSession(DialogueID, sess)
@@ -419,6 +420,10 @@ func (vr *Videoroom) processBYE(jsip *rtclib.JSIP) {
 
     if sess.jsipID == jsip.DialogueID {
         sess.unpublish()
+        if !sess.close {
+            sess.close = true
+            close(sess.quit)
+        }
         vr.decrMember(sess.jsipRoom)
     } else {
         feed, ok := sess.cachedFeed(jsip.DialogueID)

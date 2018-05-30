@@ -20,6 +20,8 @@ type session struct {
     videoroom    *Videoroom
     janusConn    *janus.Janus
     mutex         chan struct{}
+    quit          chan struct{}
+    close         bool
     feeds         map[string](*feed)
     sessId        uint64
     handleId      uint64
@@ -65,6 +67,7 @@ func (s *session) newJanusSession() {
     j.NewSess(s.sessId)
 
     go s.handleDefaultMsg()
+    go s.keepalive()
 
     log.Printf("create janus session %d success", s.sessId)
 }
@@ -480,6 +483,42 @@ func newJanus(addr string) *janus.Janus {
     }
 
     return j
+}
+
+func keepalive(j *janus.Janus, sid uint64) {
+    janusSess, _ := j.Session(sid)
+    tid := janusSess.NewTransaction()
+
+    msg := make(map[string]interface{})
+    msg["janus"] = "keepalive"
+    msg["session_id"] = sid
+    msg["transaction"] = tid
+
+    j.Send(msg)
+    reqChan, ok := janusSess.MsgChan(tid)
+    if !ok {
+        log.Printf("keepalive: can't find channel for tid %s", tid)
+    }
+
+    req := <- reqChan
+    log.Printf("keepalive: recv ack response: `%s`", req)
+}
+
+func (s *session) keepalive() {
+    /* just send keepalive per 30 second */
+    timer := time.After(30*time.Second)
+
+    for {
+        select {
+        case <- timer:
+            log.Printf("keepalive: session `%d` send a keepalive", s.sessId)
+            keepalive(s.janusConn, s.sessId)
+            timer = time.After(30*time.Second)
+        case <- s.quit:
+            log.Printf("keepalive: session `%d` closed", s.sessId)
+            return
+        }
+    }
 }
 
 func (s *session) route(remoteServer string, remoteRoom uint64) {
