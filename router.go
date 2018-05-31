@@ -7,6 +7,7 @@ package main
 import (
     "log"
     "strings"
+    "time"
 
     "janus"
     "github.com/tidwall/gjson"
@@ -478,6 +479,16 @@ func (r *router) newRemoteSession() {
     r.remoteHid = attachVideoroom(r.remoteConn, r.remoteSid)
 
     go r.handleDefaultMsg(r.remoteConn, r.remoteSid)
+    go func() {
+        for {
+            /* just send keepalive per 30 second */
+            <- time.After(30*time.Second)
+            keepalive(r.remoteConn, r.remoteSid)
+            log.Printf("keepalive: router session `%d` send a keepalive",
+                       r.remoteSid)
+        }
+    } ()
+
     log.Printf("newRemoteSession: new janus session `%d` success", r.remoteSid)
 }
 
@@ -486,6 +497,13 @@ func (r *router) newLocalSession() {
     r.localHid = attachVideoroom(r.localConn, r.localSid)
 
     go r.handleDefaultMsg(r.localConn, r.localSid)
+    go func() {
+        /* just send keepalive per 30 second */
+        <- time.After(30*time.Second)
+        keepalive(r.localConn, r.localSid)
+        log.Printf("keepalive: router session `%d` send a keepalive",
+                   r.localSid)
+    } ()
     log.Printf("newLocalSession: new janus session `%d` success", r.localSid)
 }
 
