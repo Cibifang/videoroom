@@ -41,7 +41,6 @@ type Videoroom struct {
     config     *Config
     sess       *session
     ctx        *globalCtx
-    handleFlag  bool
     msgChan     chan *rtclib.JSIP
     mutex       chan struct{}
     register    bool
@@ -437,41 +436,18 @@ func (vr *Videoroom) processBYE(jsip *rtclib.JSIP) {
     vr.ctx.delSession(jsip.DialogueID)
 }
 
-func (vr *Videoroom) handleMsg() {
-    defer func() {
-        vr.handleFlag = false
-    }()
-
-    for {
-        msg := <- vr.msgChan
-
-        switch msg.Type {
-        case rtclib.INVITE:
-            vr.processINVITE(msg)
-        case rtclib.INFO:
-            vr.processINFO(msg)
-        case rtclib.BYE:
-            vr.processBYE(msg)
-        }
-    }
-}
-
-func (vr *Videoroom) Process(jsip *rtclib.JSIP) int {
+func (vr *Videoroom) Process(jsip *rtclib.JSIP) {
     log.Println("recv msg: ", jsip)
     log.Printf("The config: %+v", vr.config)
 
-    if vr.handleFlag == false {
-        vr.handleFlag = true
-        go vr.handleMsg()
-    }
-
-    vr.msgChan <- jsip
-
     switch jsip.Type {
+    case rtclib.INVITE:
+        vr.processINVITE(jsip)
+    case rtclib.INFO:
+        vr.processINFO(jsip)
     case rtclib.BYE:
-        return rtclib.FINISH
+        vr.processBYE(jsip)
+        vr.task.SetFinished()
     }
-
-    return rtclib.CONTINUE
 }
 
