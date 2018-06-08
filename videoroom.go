@@ -2,8 +2,6 @@ package main
 
 import (
     "log"
-    "container/heap"
-    "time"
     "strconv"
     "net/http"
     "encoding/json"
@@ -22,7 +20,6 @@ import (
 
 type globalCtx struct {
     sessions    map[string](*session)
-    jh         *janusHeap
     sessLock    sync.RWMutex
     rClient    *redis.Client
 }
@@ -55,9 +52,7 @@ func GetInstance(task *rtclib.Task) rtclib.SLP {
     }
 
     if task.Ctx.Body == nil {
-        ctx := &globalCtx{sessions: make(map[string](*session)),
-                          jh: &janusHeap{},}
-        heap.Init(ctx.jh)
+        ctx := &globalCtx{sessions: make(map[string](*session)),}
 
         ctx.rClient = redis.NewClient(
             &redis.Options{
@@ -101,36 +96,6 @@ func (vr *Videoroom) lock() {
 func (vr *Videoroom) unlock() {
     <- vr.mutex
     log.Printf("unlock videoroom")
-}
-
-func (vr *Videoroom) cachedOrNewJanus() *janus.Janus {
-    if vr.ctx.jh.Len() > 0 && (*vr.ctx.jh)[0].numSess < vr.config.MaxConcurrent {
-        (*vr.ctx.jh)[0].numSess += 1
-        log.Printf("use a cached janus instance with numSess %d",
-                   (*vr.ctx.jh)[0].numSess)
-        return (*vr.ctx.jh)[0].janusConn
-    }
-
-    j := janus.NewJanus(vr.config.JanusAddr)
-    log.Printf("connectd to server %s", vr.config.JanusAddr)
-    go j.WaitMsg()
-
-    wait := 0
-    for j.ConnectStatus() == false {
-        if wait >= 5 {
-            log.Printf("wait %d s to connect, quit", wait)
-            return nil
-        }
-        timer := time.NewTimer(time.Second * 1)
-        <- timer.C
-        wait += 1
-        log.Printf("wait %d s to connect", wait)
-    }
-
-    heap.Push(vr.ctx.jh, &janusItem{janusConn: j, numSess: 1})
-    log.Printf("created a new janus instance")
-
-    return j
 }
 
 func (vr *Videoroom) incrMember(room string) {
@@ -262,7 +227,7 @@ func (vr *Videoroom) delRoom(id string) {
 }
 
 func (vr *Videoroom) newSession(jsip *rtclib.JSIP) (*session, bool) {
-    conn := vr.cachedOrNewJanus()
+    conn := janus.NewJanus(vr.config.JanusAddr)
     if conn == nil {
         return nil, false
     }
