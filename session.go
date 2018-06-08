@@ -466,25 +466,6 @@ func (s *session) candidate(candidate interface{}) {
     log.Printf("candidate: receive from channel: %s", req)
 }
 
-func newJanus(addr string) *janus.Janus {
-    j := janus.NewJanus(addr)
-    go j.WaitMsg()
-
-    wait := 0
-    for j.ConnectStatus() == false {
-        if wait >= 5 {
-            log.Printf("wait %d s to connect, quit", wait)
-            return nil
-        }
-        timer := time.NewTimer(time.Second * 1)
-        <- timer.C
-        wait += 1
-        log.Printf("wait %d s to connect", wait)
-    }
-
-    return j
-}
-
 func keepalive(j *janus.Janus, sid uint64) {
     janusSess, _ := j.Session(sid)
     tid := janusSess.NewTransaction()
@@ -523,8 +504,8 @@ func (s *session) keepalive() {
 
 func (s *session) route(remoteServer string, remoteRoom uint64) {
     router := newRouter(s.janusRoom, remoteRoom)
-    router.remoteConn = newJanus(remoteServer)
-    router.localConn = newJanus(s.videoroom.config.JanusAddr)
+    router.remoteConn = janus.NewJanus(remoteServer)
+    router.localConn = janus.NewJanus(s.videoroom.config.JanusAddr)
 
     router.newLocalSession()
     router.newRemoteSession()
