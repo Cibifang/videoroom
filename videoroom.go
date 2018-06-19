@@ -1,418 +1,257 @@
 package main
 
 import (
-    "log"
-    "strconv"
-    "net/http"
-    "encoding/json"
-    "sync"
-    "bytes"
-    "io/ioutil"
+	"log"
+	"strconv"
+	"sync"
 
-    simplejson "github.com/bitly/go-simplejson"
-    "github.com/tidwall/gjson"
-    "github.com/go-ini/ini"
-    "github.com/go-redis/redis"
-    "rtclib"
-    "janus"
+	"github.com/go-ini/ini"
+	"github.com/go-redis/redis"
+	"rtclib"
 )
 
-
 type globalCtx struct {
-    sessions    map[string](*session)
-    sessLock    sync.RWMutex
-    rClient    *redis.Client
+	rClient  *redis.Client
+	sessions sync.Map
+	routers  sync.Map
 }
 
 type Config struct {
-    JanusAddr       string
-    MaxConcurrent   uint64
-    RedisAddr       string
-    RedisPassword   string
-    RedisDB         uint64
-    ApiAddr         string
+	JanusAddr     string
+	RedisAddr     string
+	RedisPassword string
+	RedisDB       uint64
+	ApiAddr       string
 }
 
 type Videoroom struct {
-    task       *rtclib.Task
-    config     *Config
-    sess       *session
-    ctx        *globalCtx
-    msgChan     chan *rtclib.JSIP
-    mutex       chan struct{}
-    register    bool
+	task   *rtclib.Task
+	config *Config
+	ctx    *globalCtx
 }
 
 func GetInstance(task *rtclib.Task) rtclib.SLP {
-    var vr = &Videoroom{task: task,
-                        msgChan: make(chan *rtclib.JSIP, 5),
-                        mutex: make(chan struct{}, 1)}
-    if !vr.loadConfig() {
-        log.Println("Videoroom load config failed")
-    }
+	var vr = &Videoroom{
+		task: task,
+	}
+	if !vr.loadConfig() {
+		log.Println("Videoroom load config failed")
+	}
 
-    if task.Ctx.Body == nil {
-        ctx := &globalCtx{sessions: make(map[string](*session)),}
+	if task.Ctx.Body == nil {
+		var sessions sync.Map
+		var routers sync.Map
+		ctx := &globalCtx{
+			sessions: sessions,
+			routers:  routers,
+		}
 
-        ctx.rClient = redis.NewClient(
-            &redis.Options{
-                Addr:     vr.config.RedisAddr,
-                Password: vr.config.RedisPassword,
-                DB:       int(vr.config.RedisDB),
-            })
-        pong, err := ctx.rClient.Ping().Result()
-        if err != nil {
-            log.Println("Init videoroom: ping redis err: ", err)
-        }
-        log.Println("Init videoroom: ping redis, response: ", pong)
+		ctx.rClient = redis.NewClient(
+			&redis.Options{
+				Addr:     vr.config.RedisAddr,
+				Password: vr.config.RedisPassword,
+				DB:       int(vr.config.RedisDB),
+			})
+		pong, err := ctx.rClient.Ping().Result()
+		if err != nil {
+			log.Println("Init videoroom: ping redis err: ", err)
+		}
+		log.Println("Init videoroom: ping redis, response: ", pong)
 
-        task.Ctx.Body = ctx
-        log.Printf("Init videoroom ctx, ctx = %+v", task.Ctx.Body)
-    }
+		task.Ctx.Body = ctx
+		log.Printf("Init videoroom ctx, ctx = %+v", task.Ctx.Body)
+	}
 
-    vr.ctx = task.Ctx.Body.(*globalCtx)
-    return vr
+	vr.ctx = task.Ctx.Body.(*globalCtx)
+	return vr
 }
 
 func (vr *Videoroom) loadConfig() bool {
-    vr.config = new(Config)
+	vr.config = new(Config)
 
-    confPath := rtclib.RTCPATH + "/conf/Videoroom.ini"
+	confPath := rtclib.RTCPATH + "/conf/Videoroom.ini"
 
-    f, err := ini.Load(confPath)
-    if err != nil {
-        log.Printf("Load config file %s error: %v", confPath, err)
-        return false
-    }
+	f, err := ini.Load(confPath)
+	if err != nil {
+		log.Printf("Load config file %s error: %v", confPath, err)
+		return false
+	}
 
-    return rtclib.Config(f, "Videoroom", vr.config)
-}
-
-func (vr *Videoroom) lock() {
-    vr.mutex <- struct{}{}
-    log.Printf("lock videoroom")
-}
-
-func (vr *Videoroom) unlock() {
-    <- vr.mutex
-    log.Printf("unlock videoroom")
-}
-
-func (vr *Videoroom) incrMember(room string) {
-    err := vr.ctx.rClient.HIncrBy("member", room, 1).Err()
-    if err != nil {
-        log.Printf("incrMember: redis err: %s", err.Error())
-    }
-}
-
-func (vr *Videoroom) decrMember(room string) {
-    num, err := vr.ctx.rClient.HIncrBy("member", room, -1).Result()
-    if err != nil {
-        log.Printf("decrMember: redis err: %s", err.Error())
-        return
-    }
-
-    if num <= 0 {
-        log.Printf("decrMember: room %s don't have any member, delete it", room)
-        vr.delMember(room)
-        vr.delRoom(room)
-        if vr.register {
-            vr.deregisterRoom(vr.sess.jsipRoom)
-        }
-    }
-}
-
-func (vr *Videoroom) delMember(room string) {
-    num, err := vr.ctx.rClient.HDel("member", room).Result()
-    if err != nil {
-        log.Printf("delMember: redis err: %s", err.Error())
-    }
-
-    log.Printf("delMember: delete %d for room %s", num, room)
-}
-
-func (vr *Videoroom) registerRoom(id string, room uint64) {
-    msg := make(map[string]interface{})
-    msg["janus"] = vr.config.JanusAddr
-    msg["room"] = room
-
-    b, err := json.Marshal(msg)
-    if err != nil {
-        log.Println("registerRoom: json err: ", err)
-        return
-    }
-
-    addr := vr.config.ApiAddr + "/register/" + id
-    contentType := "application/json;charset=utf-8"
-    body := bytes.NewBuffer(b)
-
-    resp, err := http.Post(addr, contentType, body)
-    if err != nil {
-        log.Println("registerRoom: post err: ", err)
-        return
-    }
-
-    defer resp.Body.Close()
-    rBody, err := ioutil.ReadAll(resp.Body)
-    if err != nil {
-        log.Println("registerRoom: read err: ", err)
-    }
-
-    if resp.StatusCode != http.StatusOK {
-        log.Printf("registerRoom: register failed, response code: `%d`, " +
-                   "body: `%s`", resp.StatusCode, rBody)
-        return
-    }
-
-    if gjson.GetBytes(rBody, "register").Bool() == true {
-        vr.register = true
-        return
-    }
-
-    janusAddr := gjson.GetBytes(rBody, "janus").String()
-    remoteRoom := gjson.GetBytes(rBody, "room").Uint()
-    vr.sess.route(janusAddr, remoteRoom)
-}
-
-func (vr *Videoroom) deregisterRoom(id string) {
-    addr := vr.config.ApiAddr + "/deregister/" + id
-    resp, err := http.Get(addr)
-    if err != nil {
-        log.Println("deregisterRoom: get err: ", err)
-        return
-    }
-
-    if resp.StatusCode != http.StatusOK {
-        log.Printf("deregisterRoom: deregister failed, response code: `%d`",
-                   resp.StatusCode)
-        return
-    }
-
-    vr.register = false
-    return
-}
-
-func (vr *Videoroom) setRoom(id string, room uint64) {
-    err := vr.ctx.rClient.HSet("room", id, room).Err()
-    if err != nil {
-        log.Printf("setRoom: redis err: %s", err.Error())
-        return
-    }
-
-    vr.incrMember(id)
-
-    go vr.registerRoom(id, room)
-}
-
-func (vr *Videoroom) getRoom(id string) (uint64, bool) {
-    room, err := vr.ctx.rClient.HGet("room", id).Uint64()
-    if err == redis.Nil {
-        log.Printf("getRoom: room %s isn't existed", id)
-    } else if err != nil {
-        log.Printf("getRoom: redis err: %s", err.Error())
-    } else {
-        return room, true
-    }
-
-    return room, false
-}
-
-func (vr *Videoroom) delRoom(id string) {
-    num, err := vr.ctx.rClient.HDel("room", id).Result()
-    if err != nil {
-        log.Printf("delRoom: redis err: %s", err.Error())
-    }
-
-    log.Printf("delRoom: delete %d for room %s", num, id)
-}
-
-func (vr *Videoroom) newSession(jsip *rtclib.JSIP) (*session, bool) {
-    conn := janus.NewJanus(vr.config.JanusAddr)
-    if conn == nil {
-        return nil, false
-    }
-
-    DialogueID := jsip.DialogueID
-    sess := &session{jsipID: DialogueID,
-                     url: jsip.RequestURI,
-                     janusConn: conn,
-                     videoroom: vr,
-                     jsipRoom: jsip.To,
-                     userName: jsip.From,
-                     mutex: make(chan struct{}, 1),
-                     quit: make(chan struct{}),
-                     feeds: make(map[string](*feed)),}
-    vr.sess = sess
-    vr.setSession(DialogueID, sess)
-    log.Printf("create videoroom for DialogueID %s success", DialogueID)
-    return sess, true
-}
-
-func (vr *Videoroom) setSession(id string, sess *session) {
-    vr.ctx.setSession(id, sess)
-}
-
-func (vr *Videoroom) cachedSession() (*session) {
-    sess := vr.sess
-    return sess
-}
-
-func (ctx *globalCtx) cachedSession(DialogueID string) (*session, bool) {
-    ctx.sessLock.RLock()
-    sess, exist := ctx.sessions[DialogueID]
-    ctx.sessLock.RUnlock()
-    return sess, exist
-}
-
-func (ctx *globalCtx) setSession(id string, sess *session) {
-    ctx.sessLock.Lock()
-    ctx.sessions[id] = sess
-    ctx.sessLock.Unlock()
-}
-
-func (ctx *globalCtx) delSession(id string) {
-    ctx.sessLock.Lock()
-    defer ctx.sessLock.Unlock()
-    delete(ctx.sessions, id)
-}
-
-func (vr *Videoroom) processINVITE(jsip *rtclib.JSIP) {
-    if jsip.Code != 0 {
-        vr.processFeed(jsip)
-        return
-    }
-
-    vr.lock()
-    sess, ok := vr.newSession(jsip)
-    if !ok {
-        log.Printf("invite: create session failed")
-        return
-    }
-    sess.lock()
-    vr.unlock()
-    sess.newJanusSession()
-    sess.attachVideoroom()
-    sess.getRoom()
-    sess.joinRoom()
-    offer, _ := jsip.Body.(*simplejson.Json).String()
-    answer := sess.offer(offer)
-    sess.unlock()
-    resp := &rtclib.JSIP{
-        Type:       jsip.Type,
-        Code:       200,
-        From:       jsip.From,
-        To:         jsip.To,
-        CSeq:       jsip.CSeq,
-        DialogueID: jsip.DialogueID,
-        RawMsg:     make(map[string]interface{}),
-        Body:       answer,
-    }
-
-    rtclib.SendJsonSIPMsg(nil, resp)
-}
-
-func (vr *Videoroom) processINFO(jsip *rtclib.JSIP) {
-    vr.lock()
-    sess, ok := vr.ctx.cachedSession(jsip.DialogueID)
-    vr.unlock()
-    if !ok {
-        log.Printf("not found cached session for id %s", jsip.DialogueID)
-        return
-    }
-
-    candidate, exist := jsip.Body.(*simplejson.Json).CheckGet("candidate")
-    if exist == false {
-        /* Now the info only transport candidate */
-        log.Printf("not found candidate")
-        return
-    }
-
-    feed, ok := sess.cachedFeed(jsip.DialogueID)
-    if !ok {
-        sess.lock()
-        sess.candidate(candidate)
-        sess.unlock()
-    } else {
-        feed.candidate(candidate)
-    }
-
-    rtclib.SendJSIPRes(jsip, 200)
-}
-
-func (vr *Videoroom) processFeed(jsip *rtclib.JSIP) {
-    sess, ok := vr.ctx.cachedSession(jsip.DialogueID)
-    if !ok {
-        log.Printf("not found cached session for id %s", jsip.DialogueID)
-        return
-    }
-
-    feed, ok := sess.cachedFeed(jsip.DialogueID)
-    if !ok {
-        log.Printf("not found cached feed for id %s for sess %s",
-                   jsip.DialogueID, sess.jsipID)
-        return
-    }
-
-    answer, err := jsip.Body.(*simplejson.Json).Get("sdp").String()
-    if err != nil {
-        log.Printf("not found sdp for session %s in the respnse", sess.jsipID)
-        return
-    }
-
-    feed.start(answer)
-
-    resp := &rtclib.JSIP{
-        Type:       rtclib.ACK,
-        RequestURI: sess.jsipRoom,
-        From:       jsip.From,
-        To:         jsip.To,
-        DialogueID: jsip.DialogueID,
-        RawMsg:     make(map[string]interface{}),
-    }
-
-    resp.RawMsg["RelatedID"] = json.Number(strconv.FormatUint(jsip.CSeq, 10))
-
-    rtclib.SendJsonSIPMsg(nil, resp)
-}
-
-func (vr *Videoroom) processBYE(jsip *rtclib.JSIP) {
-    sess, ok := vr.ctx.cachedSession(jsip.DialogueID)
-    if !ok {
-        log.Printf("BYE: not found cached session for id %s", jsip.DialogueID)
-        return
-    }
-
-    if sess.jsipID == jsip.DialogueID {
-        sess.unpublish()
-        if !sess.close {
-            sess.close = true
-            close(sess.quit)
-        }
-        vr.decrMember(sess.jsipRoom)
-    } else {
-        feed, ok := sess.cachedFeed(jsip.DialogueID)
-        if !ok {
-            log.Printf("BYE: not found cached feed for id %s for sess %s",
-                       jsip.DialogueID, sess.jsipID)
-            return
-        }
-        sess.detach(feed.handleId)
-    }
-    vr.ctx.delSession(jsip.DialogueID)
+	return rtclib.Config(f, "Videoroom", vr.config)
 }
 
 func (vr *Videoroom) Process(jsip *rtclib.JSIP) {
-    log.Println("recv msg: ", jsip)
-    log.Printf("The config: %+v", vr.config)
+	log.Printf("videoroom: recv msg: %+v", jsip)
+	log.Printf("videoroom: The config: %+v", vr.config)
 
-    switch jsip.Type {
-    case rtclib.INVITE:
-        vr.processINVITE(jsip)
-    case rtclib.INFO:
-        vr.processINFO(jsip)
-    case rtclib.BYE:
-        vr.processBYE(jsip)
-        vr.task.SetFinished()
-    }
+	PAI, exist := jsip.RawMsg["P-Asserted-Identity"]
+	if !exist {
+		log.Printf("videoroom: no P-Asserted-Identity in message, ignore")
+		return
+	}
+	user, _ := PAI.(string)
+
+	msg := message{desc: "jsip", content: jsip}
+
+	if jsip.RequestURI == rtclib.Realm() {
+		fromRouter, exist := jsip.RawMsg["RouterMessage"]
+		if !exist || !fromRouter.(bool) {
+			log.Printf("videoroom: msg is sent to router")
+			cachedRouter, exist := vr.ctx.routers.Load(user)
+			if !exist {
+				log.Printf("videoroom: not found router `%s`", user)
+				return
+			}
+			router := cachedRouter.(*router)
+			sendMessage(msg, router.msgChan)
+			return
+		}
+		log.Printf("videoroom: msg is sent from router")
+	}
+
+	session, exist := vr.cachedSession(user)
+	if exist {
+		sendMessage(msg, session.msgChan)
+		return
+	}
+
+	if jsip.Type != rtclib.INVITE || jsip.Code != 0 {
+		log.Printf("videoroom: no session for user `%s`", user)
+	}
+
+	vr.newSession(user)
+	session, exist = vr.cachedSession(user)
+	if !exist {
+		log.Printf("videoroom: create session for user `%s` failed", user)
+		vr.finish()
+		return
+	}
+
+	session.id = jsip.RequestURI
+	sendMessage(msg, session.msgChan)
 }
 
+func (vr *Videoroom) newSession(user string) {
+	session := newSession(vr, user)
+	if session == nil {
+		return
+	}
+
+	_, ok := vr.ctx.sessions.LoadOrStore(user, session)
+	if !ok {
+		log.Printf("videoroom: session for user `%s` is rewrited", user)
+	}
+}
+
+func (vr *Videoroom) cachedSession(user string) (*session, bool) {
+	s, exist := vr.ctx.sessions.Load(user)
+	if !exist {
+		return nil, exist
+	}
+	return s.(*session), exist
+}
+
+func (vr *Videoroom) deleteSession(user string) {
+	vr.ctx.sessions.Delete(user)
+}
+
+func (vr *Videoroom) finish() {
+	vr.task.SetFinished()
+}
+
+func (ctx *globalCtx) getRoom(rtcRoom string) (uint64, bool) {
+	room, err := ctx.rClient.HGet("room", rtcRoom).Uint64()
+	if err == redis.Nil {
+		log.Printf("getRoom: room %s isn't existed", rtcRoom)
+	} else if err != nil {
+		log.Printf("getRoom: redis err: %s", err.Error())
+	} else {
+		return room, true
+	}
+
+	return room, false
+}
+
+func (ctx *globalCtx) getRtcRoom(room uint64) (string, bool) {
+	roomStr := strconv.FormatUint(uint64(room), 10)
+	rtcRoom, err := ctx.rClient.HGet("rtcRoom", roomStr).Result()
+	if err == redis.Nil {
+		log.Printf("getRtcRoom: room %d isn't existed", room)
+	} else if err != nil {
+		log.Printf("getRtcRoom: redis err: %s", err.Error())
+	} else {
+		return rtcRoom, true
+	}
+
+	return rtcRoom, false
+}
+
+func (ctx *globalCtx) setRoom(rtcRoom string, room uint64) {
+	err := ctx.rClient.HSet("room", rtcRoom, room).Err()
+	if err != nil {
+		log.Printf("setRoom: redis err: %s", err.Error())
+		return
+	}
+
+	roomStr := strconv.FormatUint(uint64(room), 10)
+	err = ctx.rClient.HSet("rtcRoom", roomStr, rtcRoom).Err()
+	if err != nil {
+		log.Printf("setRoom: redis err: %s", err.Error())
+		return
+	}
+
+	ctx.incrMember(rtcRoom)
+}
+
+func (ctx *globalCtx) delRoom(rtcRoom string) {
+	janusRoom, exist := ctx.getRoom(rtcRoom)
+	if !exist {
+		log.Printf("delRoom: no room `%s`", rtcRoom)
+		return
+	}
+
+	_, err := ctx.rClient.HDel("room", rtcRoom).Result()
+	if err != nil {
+		log.Printf("delRoom: redis err: %s", err.Error())
+		return
+	}
+
+	roomStr := strconv.FormatUint(uint64(janusRoom), 10)
+	_, err = ctx.rClient.HDel("rtcRoom", roomStr).Result()
+	if err != nil {
+		log.Printf("delRoom: redis err: %s", err.Error())
+		return
+	}
+
+	_, err = ctx.rClient.HDel("member", rtcRoom).Result()
+	if err != nil {
+		log.Printf("delRoom: redis err: %s", err.Error())
+		return
+	}
+
+	log.Printf("delRoom: delete room `%d`:`%s`", janusRoom, rtcRoom)
+}
+
+func (ctx *globalCtx) incrMember(rtcRoom string) {
+	err := ctx.rClient.HIncrBy("member", rtcRoom, 1).Err()
+	if err != nil {
+		log.Printf("incrMember: redis err: %s", err.Error())
+	}
+}
+
+func (ctx *globalCtx) decrMember(room string) {
+	num, err := ctx.rClient.HIncrBy("member", room, -1).Result()
+	if err != nil {
+		log.Printf("decrMember: redis err: %s", err.Error())
+		return
+	}
+
+	if num <= 0 {
+		log.Printf("decrMember: room %s don't have any member, delete it", room)
+		ctx.delRoom(room)
+	}
+}
+
+func (vr *Videoroom) newDialogueID() string {
+	return vr.task.NewDialogueID()
+}

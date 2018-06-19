@@ -5,648 +5,659 @@
 package main
 
 import (
-    "log"
-    "strings"
-    "time"
+	"encoding/json"
+	"log"
+	"strconv"
+	"time"
 
-    "janus"
-    "github.com/tidwall/gjson"
+	simplejson "github.com/bitly/go-simplejson"
+	uuid "github.com/satori/go.uuid"
+	"github.com/tidwall/gjson"
+	"janus"
+	"rtclib"
 )
 
 type router struct {
-    localSid    uint64
-    remoteSid   uint64
-    localConn  *janus.Janus
-    remoteConn *janus.Janus
-    localRoom   uint64
-    remoteRoom  uint64
-    localHid    uint64
-    remoteHid   uint64
-    localPrivateId uint64
-    remotePrivateId uint64
-    listeners   map[uint64]*listener
-    publishers  map[uint64]bool
+	remote  string
+	local   string
+	msgChan chan message
+	close   chan bool
+	global  *globalCtx
+	process map[string](chan message)
+	feeds   map[feed]string
+
+	sid       uint64
+	janusConn *janus.Janus
 }
 
-type listener struct {
-    id          uint64
-    listenHid  uint64
-    publishHid  uint64
+type routerPub struct {
+	rou        *router
+	hid        uint64
+	dialogueID string
 }
 
-func newListener(id uint64, listen uint64, publish uint64) *listener {
-    return &listener{id: id,
-                     listenHid: listen,
-                     publishHid: publish,}
+type routerLis struct {
+	rou        *router
+	hid        uint64
+	feed       feed
+	dialogueID string
+	rtcRoom    string
 }
 
-func newRouter(localRoom uint64, remoteRoom uint64) *router {
-    return &router{localRoom: localRoom,
-                   listeners: make(map[uint64]*listener),
-                   publishers: make(map[uint64]bool),
-                   remoteRoom: remoteRoom,}
+func newRouter(remote string, conn *janus.Janus, ctx *globalCtx) *router {
+	sid := newJanusSession(conn)
+	router := &router{
+		sid:       sid,
+		local:     rtclib.Realm(),
+		remote:    remote,
+		janusConn: conn,
+		msgChan:   make(chan message),
+		close:     make(chan bool),
+		global:    ctx,
+		process:   make(map[string](chan message)),
+		feeds:     make(map[feed]string),
+	}
+
+	go router.keepalive()
+	go router.main()
+	return router
 }
 
-func newJanusSession(j *janus.Janus) uint64 {
-    tid := j.NewTransaction()
+func (r *router) new(janusRoom uint64) {
+	hid := attachVideoroom(r.janusConn, r.sid)
+	publishMsg := publish(r.janusConn, r.sid, hid, janusRoom, "router")
+	if publishMsg == nil {
+		log.Printf("router: room `%d` has no publisher now", janusRoom)
+		return
+	}
 
-    msg:= make(map[string]interface{})
-    msg["janus"] = "create"
-    msg["transaction"] = tid
+	data := gjson.GetBytes(publishMsg, "plugindata.data")
+	publishers := data.Get("publishers").Array()
+	for _, pubMsg := range publishers {
+		f := feed{
+			room:    janusRoom,
+			pid:     pubMsg.Get("id").Uint(),
+			display: pubMsg.Get("display").String(),
+		}
+		r.notifyFeed(f)
+	}
 
-    j.Send(msg)
-    reqChan, ok := j.MsgChan(tid)
-    if !ok {
-        log.Printf("newJanusSession: can't find channel for tid %s", tid)
-    }
-
-    req := <- reqChan
-    if gjson.GetBytes(req, "janus").String() != "success" {
-        log.Printf("newJanusSession: failed, fail message: `%s`", req)
-        return 0
-    }
-
-    sessId := gjson.GetBytes(req, "data.id").Uint()
-    j.NewSess(sessId)
-
-    log.Printf("newJanusSession: new janus session `%d` success", sessId)
-    return sessId
+	return
 }
 
-func attachVideoroom(j *janus.Janus, sid uint64) uint64 {
-    janusSess, _ := j.Session(sid)
-    tid := janusSess.NewTransaction()
+func (r *router) main() {
+	janusSess, _ := r.janusConn.Session(r.sid)
+	janusMsg := janusSess.DefaultMsgChan()
 
-    msg := make(map[string]interface{})
-    msg["janus"] = "attach"
-    msg["plugin"] = "janus.plugin.videoroom"
-    msg["transaction"] = tid
-    msg["session_id"] = sid
-
-    j.Send(msg)
-    reqChan, ok := janusSess.MsgChan(tid)
-    if !ok {
-        log.Printf("attachVideoroom: can't find channel for tid %s", tid)
-    }
-
-    req := <- reqChan
-    if gjson.GetBytes(req, "janus").String() != "success" {
-        log.Printf("attachVideoroom: failed, fail message: `%s`", req)
-        return 0
-    }
-
-    handleId := gjson.GetBytes(req, "data.id").Uint()
-    janusSess.Attach(handleId)
-
-    log.Printf("attachVideoroom: session `%d` attach handler `%d` success",
-               sid, handleId)
-    return handleId
+	for {
+		select {
+		case <-r.close:
+			return
+		case msg := <-r.msgChan:
+			log.Printf("router: receive msg `%+v`", msg)
+			r.messageHandle(msg)
+			log.Printf("router: msg `%+v` process end", msg)
+		case msg := <-janusMsg:
+			r.janusMessage(msg)
+		}
+	}
 }
 
-func publish(j *janus.Janus, sid uint64, hid uint64, room uint64,
-             display string) []byte {
-    janusSess, _ := j.Session(sid)
-    tid := janusSess.NewTransaction()
+func (r *router) janusMessage(msg []byte) {
+	switch gjson.GetBytes(msg, "janus").String() {
+	case "event":
+		plugindata := gjson.GetBytes(msg, "plugindata")
+		if !plugindata.Exists() {
+			return
+		}
 
-    msg := make(map[string]interface{})
-    body := make(map[string]interface{})
-    body["request"] = "join"
-    body["room"] = room
-    body["ptype"] = "publisher"
-    body["display"] = display
-    msg["janus"] = "message"
-    msg["transaction"] = tid
-    msg["session_id"] = sid
-    msg["handle_id"] = hid
-    msg["body"] = body
+		data := plugindata.Get("data")
+		if !data.Exists() {
+			return
+		}
 
-    j.Send(msg)
-    reqChan, ok := janusSess.MsgChan(tid)
-    if !ok {
-        log.Printf("publish: can't find channel for tid %s", tid)
-    }
+		// We just handle event message now.
+		if data.Get("videoroom").String() != "event" {
+			return
+		}
 
-    for {
-        req := <- reqChan
-        switch gjson.GetBytes(req, "janus").String() {
-        case "ack":
-            log.Printf("publish: receive ack")
-        case "error":
-            log.Printf("publish: receive error msg `%s`", req)
-            return nil
-        case "event":
-            log.Printf("publish: receive success msg `%s`", req)
-            return req
-        }
-    }
+		if data.Get("publishers").Exists() {
+			publishers := data.Get("publishers").Array()
+			for _, pubMsg := range publishers {
+				feed := feed{
+					room:    data.Get("room").Uint(),
+					pid:     pubMsg.Get("id").Uint(),
+					display: pubMsg.Get("display").String(),
+				}
+				r.notifyFeed(feed)
+			}
+		} else if data.Get("unpublished").Exists() {
+			feed := feed{
+				room: data.Get("room").Uint(),
+				pid:  data.Get("unpublished").Uint(),
+			}
+			r.notifyUnpublish(feed)
+		}
+	}
 }
 
-func unpublish(j *janus.Janus, sid uint64, hid uint64) {
-    janusSess, _ := j.Session(sid)
-    tid := janusSess.NewTransaction()
+func (r *router) messageHandle(msg message) {
+	switch msg.desc {
+	case "jsip":
+		jsip := msg.content.(*rtclib.JSIP)
+		id := jsip.DialogueID
+		msgChan, exist := r.process[id]
+		if exist {
+			go sendMessage(msg, msgChan)
+			return
+		}
 
-    msg := make(map[string]interface{})
-    body := make(map[string]interface{})
-    body["request"] = "unpublish"
-    msg["janus"] = "message"
-    msg["transaction"] = tid
-    msg["session_id"] = sid
-    msg["handle_id"] = hid
+		if jsip.Type != rtclib.INVITE || jsip.Code != 0 {
+			log.Printf("router: no process for id `%s`", id)
+			return
+		}
 
-    j.Send(msg)
-    reqChan, ok := janusSess.MsgChan(tid)
-    if !ok {
-        log.Printf("unpublish: can't find channel for tid %s", tid)
-    }
+		msgChan = make(chan message)
+		r.process[id] = msgChan
 
-    for {
-        req := <- reqChan
-        switch gjson.GetBytes(req, "janus").String() {
-        case "ack":
-            log.Printf("unpublish: receive ack")
-        case "error":
-            log.Printf("unpublish: recevie error msg `%s`", req)
-            return
-        case "event":
-            log.Printf("unpublish: receive success msg `%s`", req)
-            return
-        }
-    }
+		go r.publish(msgChan, id)
+		go sendMessage(msg, msgChan)
+	case "notifyFeed":
+		feed := msg.content.(feed)
+		_, exist := r.feeds[feed]
+		if exist {
+			return
+		}
+
+		id := r.newDialogueID()
+		for {
+			_, exist := r.process[id]
+			if exist {
+				log.Printf("router: id `%s` already exist", id)
+				id = r.newDialogueID()
+			}
+			break
+		}
+		msgChan := make(chan message)
+		r.process[id] = msgChan
+		r.feeds[feed] = id
+		go r.listen(msgChan, id, feed)
+	case "notifyUnpublish":
+		unpub := msg.content.(feed)
+
+		// Unpublish message don't have display value.
+		id := ""
+		for feed := range r.feeds {
+			if feed.pid == unpub.pid && feed.room == unpub.room {
+				id = r.feeds[feed]
+				delete(r.feeds, feed)
+				break
+			}
+		}
+
+		if id != "" {
+			msgChan := r.process[id]
+			go sendMessage(msg, msgChan)
+		}
+
+		return
+	case "registerPublisher":
+		pubMsg := msg.content.(map[string]interface{})
+		id := pubMsg["id"].(string)
+		feed := pubMsg["feed"].(feed)
+		r.feeds[feed] = id
+	case "notifyQuit":
+		id := msg.content.(string)
+		delete(r.process, id)
+		// TODO: Divide Pub and Listen to finish.
+		if len(r.process) == 0 {
+			log.Printf("messageHandle: all process is done")
+			r.finish()
+		}
+
+		for key, value := range r.feeds {
+			if value == id {
+				delete(r.feeds, key)
+				break
+			}
+		}
+	}
 }
 
-func listen(j *janus.Janus, sid uint64, hid uint64, room uint64, feed uint64,
-    privateId uint64) string {
-    janusSess, _ := j.Session(sid)
-    tid := janusSess.NewTransaction()
+func (r *router) publish(msgChan chan message, id string) {
+	defer r.notifyQuit(id)
 
-    msg := make(map[string]interface{})
-    body := make(map[string]interface{})
-    body["request"] = "join"
-    body["room"] = room
-    body["ptype"] = "listener"
-    body["feed"] = feed
-    body["private_id"] = privateId
-    msg["janus"] = "message"
-    msg["transaction"] = tid
-    msg["session_id"] = sid
-    msg["handle_id"] = hid
-    msg["body"] = body
+	hid := attachVideoroom(r.janusConn, r.sid)
+	pub := routerPub{
+		rou:        r,
+		hid:        hid,
+		dialogueID: id,
+	}
 
-    j.Send(msg)
-    reqChan, ok := janusSess.MsgChan(tid)
-    if !ok {
-        log.Printf("listen: can't find channel for tid %s", tid)
-    }
-
-    for {
-        req := <-reqChan
-        switch gjson.GetBytes(req, "janus").String() {
-        case "ack":
-            log.Printf("listen: receive ack")
-        case "error":
-            log.Printf("listen: receive err msg `%s`", req)
-            return ""
-        case "event":
-            log.Printf("listen: receive success msg `%s`", req)
-            return gjson.GetBytes(req, "jsep.sdp").String()
-        }
-    }
+	for {
+		select {
+		case <-r.close:
+			return
+		case msg := <-msgChan:
+			if !pub.messageHandle(msg) {
+				log.Printf("publish(r): process `%d` quit", hid)
+				return
+			}
+		}
+	}
 }
 
-func configure(j *janus.Janus, sid uint64, hid uint64, sdp string) string {
-    janusSess, _ := j.Session(sid)
-    tid := janusSess.NewTransaction()
+func (pub *routerPub) messageHandle(msg message) bool {
+	r := pub.rou
+	switch msg.desc {
+	case "jsip":
+		jsip := msg.content.(*rtclib.JSIP)
+		switch jsip.Type {
+		case rtclib.INVITE:
+			body := jsip.Body.(*simplejson.Json)
+			rtcRoom, err := body.Get("room").String()
+			if err != nil {
+				log.Printf("publish(r): not room in message `%+v`", jsip)
+				return false
+			}
+			display := jsip.From
+			offer, err := body.Get("sdp").String()
+			if err != nil {
+				log.Printf("publish(r): not sdp in message `%+v`", jsip)
+				return false
+			}
 
-    msg := make(map[string]interface{})
-    body := make(map[string]interface{})
-    jsep := make(map[string]interface{})
-    body["request"] = "configure"
-    body["audio"] = true
-    body["video"] = true
-    jsep["type"] = "offer"
-    jsep["sdp"] = sdp
-    msg["janus"] = "message"
-    msg["transaction"] = tid
-    msg["session_id"] = sid
-    msg["handle_id"] = hid
-    msg["body"] = body
-    msg["jsep"] = jsep
+			room, exist := r.getRoom(rtcRoom)
+			if !exist {
+				log.Printf("publish(r): no room record for `%s`", rtcRoom)
+				return false
+			}
+			publishMsg := publish(r.janusConn, r.sid, pub.hid, room, display)
+			if publishMsg == nil {
+				return false
+			}
 
-    j.Send(msg)
-    reqChan, ok := janusSess.MsgChan(tid)
-    if !ok {
-        log.Printf("configure: can't find channel for tid %s", tid)
-    }
+			data := gjson.GetBytes(publishMsg, "plugindata.data")
+			pid := data.Get("id").Uint()
+			f := feed{room: room, pid: pid, display: display}
+			r.registerPublisher(pub.dialogueID, f)
+			publishers := data.Get("publishers").Array()
+			for _, pubMsg := range publishers {
+				f := feed{
+					room:    room,
+					pid:     pubMsg.Get("id").Uint(),
+					display: pubMsg.Get("display").String(),
+				}
+				r.notifyFeed(f)
+			}
 
-    for {
-        req := <- reqChan
-        switch gjson.GetBytes(req, "janus").String() {
-        case "ack":
-            log.Printf("configure: receive ack")
-        case "error":
-            log.Printf("configure: receive err msg `%s`", req)
-            return ""
-        case "event":
-            log.Printf("configure: receive success msg `%s`", req)
-            return gjson.GetBytes(req, "jsep.sdp").String()
-        }
-    }
+			answer := configure(r.janusConn, r.sid, pub.hid, offer)
+			if answer == "" {
+				return false
+			}
+
+			candidates := getCandidatesFromSdp(answer)
+			index := 0
+			for _, candidate := range candidates {
+				body := make(map[string]interface{})
+				subBody := make(map[string]interface{})
+				subBody["candidate"] = candidate
+				subBody["sdpMLineIndex"] = index
+				subBody["sdmMid"] = "sdp"
+				body["candidate"] = subBody
+				requestRawMsg := make(map[string]interface{})
+				requestRawMsg["P-Asserted-Identity"] = jsip.RequestURI
+				requestRawMsg["RouterMessage"] = true
+
+				request := &rtclib.JSIP{
+					Type:       rtclib.INFO,
+					RequestURI: r.remote,
+					From:       jsip.To,
+					To:         rtcRoom,
+					DialogueID: jsip.DialogueID,
+					Body:       body,
+					RawMsg:     requestRawMsg,
+				}
+				rtclib.SendJsonSIPMsg(nil, request)
+			}
+			if len(candidates) > 0 {
+				body := make(map[string]interface{})
+				subBody := make(map[string]interface{})
+				subBody["completed"] = true
+				body["candidate"] = subBody
+				requestRawMsg := make(map[string]interface{})
+				requestRawMsg["P-Asserted-Identity"] = jsip.RequestURI
+				requestRawMsg["RouterMessage"] = true
+
+				request := &rtclib.JSIP{
+					Type:       rtclib.INFO,
+					RequestURI: r.remote,
+					From:       jsip.To,
+					To:         rtcRoom,
+					DialogueID: jsip.DialogueID,
+					Body:       body,
+					RawMsg:     requestRawMsg,
+				}
+				rtclib.SendJsonSIPMsg(nil, request)
+			}
+
+			responseBody := make(map[string]interface{})
+			responseBody["type"] = "answer"
+			responseBody["sdp"] = answer
+			responseRawMsg := make(map[string]interface{})
+			responseRawMsg["P-Asserted-Identity"] = jsip.RequestURI
+			responseRawMsg["RouterMessage"] = true
+
+			response := &rtclib.JSIP{
+				Type:       rtclib.INVITE,
+				Code:       200,
+				From:       jsip.To,
+				To:         rtcRoom,
+				CSeq:       jsip.CSeq,
+				DialogueID: jsip.DialogueID,
+				RawMsg:     responseRawMsg,
+				Body:       responseBody,
+			}
+
+			rtclib.SendJsonSIPMsg(nil, response)
+			return true
+		case rtclib.INFO:
+			if jsip.Code != 0 {
+				return true
+			}
+			body := jsip.Body.(*simplejson.Json)
+			date, exist := body.CheckGet("candidate")
+			if exist == false {
+				/* Now the info only transport candidate */
+				log.Printf("publish: not found candidate from INFO msg")
+				return false
+			}
+
+			completed, err := date.Get("completed").Bool()
+			if err == nil && completed == true {
+				completeCandidate(r.janusConn, r.sid, pub.hid)
+			} else {
+				value, _ := date.Get("candidate").String()
+				mid, _ := date.Get("sdpMid").String()
+				index, _ := date.Get("sdpMLineIndex").Uint64()
+				candidate(r.janusConn, r.sid, pub.hid, index, value, mid)
+			}
+
+			responseRawMsg := make(map[string]interface{})
+			responseRawMsg["P-Asserted-Identity"] = jsip.RequestURI
+			responseRawMsg["RouterMessage"] = true
+			response := &rtclib.JSIP{
+				Type:       rtclib.INFO,
+				Code:       200,
+				From:       jsip.To,
+				To:         jsip.From,
+				CSeq:       jsip.CSeq,
+				DialogueID: jsip.DialogueID,
+				RawMsg:     responseRawMsg,
+			}
+			rtclib.SendJsonSIPMsg(nil, response)
+			return true
+		case rtclib.BYE:
+			unpublish(r.janusConn, r.sid, pub.hid)
+			detach(r.janusConn, r.sid, pub.hid)
+
+			return false
+		}
+	}
+	return true
 }
 
-func candidate(j *janus.Janus, sid uint64, hid uint64, candiStr string,
-               sdpMid string, sdpMLineIndex uint64) {
-    janusSess, _ := j.Session(sid)
-    tid := janusSess.NewTransaction()
+func (r *router) listen(msgChan chan message, id string, feed feed) {
+	defer r.notifyQuit(id)
 
-    msg := make(map[string]interface{})
-    candidate := make(map[string]interface{})
-    candidate["candidate"] = candiStr
-    candidate["sdpMid"] = sdpMid
-    candidate["sdpMLineIndex"] = sdpMLineIndex
-    msg["janus"] = "trickle"
-    msg["session_id"] = sid
-    msg["handle_id"] = hid
-    msg["transaction"] = tid
-    msg["candidate"] = candidate
+	pubHid := attachVideoroom(r.janusConn, r.sid)
+	// Need private_id, so must join as publisher first.
+	joinMsg := publish(r.janusConn, r.sid, pubHid, feed.room, feed.display)
+	data := gjson.GetBytes(joinMsg, "plugindata.data")
+	privateID := data.Get("private_id").Uint()
 
-    j.Send(msg)
-    reqChan, ok := janusSess.MsgChan(tid)
-    if !ok {
-        log.Printf("candidate: can't find channel for tid %s", tid)
-    }
+	hid := attachVideoroom(r.janusConn, r.sid)
+	offer := listen(r.janusConn, r.sid, hid, feed.room, feed.pid, privateID)
 
-    req := <- reqChan
-    log.Printf("candidate: receive from channel: %s", req)
+	rtcRoom, exist := r.getRtcRoom(feed.room)
+	if !exist {
+		log.Printf("listen(r): can't find rtcRoom, ignore")
+		return
+	}
+	body := make(map[string]interface{})
+	body["type"] = "offer"
+	body["sdp"] = offer
+	rawMsg := make(map[string]interface{})
+	rawMsg["P-Asserted-Identity"] = r.local
+	rawMsg["RouterMessage"] = true
+
+	request := &rtclib.JSIP{
+		Type:       rtclib.INVITE,
+		RequestURI: r.remote,
+		From:       feed.display,
+		To:         rtcRoom,
+		DialogueID: id,
+		RawMsg:     rawMsg,
+		Body:       body,
+	}
+	rtclib.SendJSIPReq(request, id)
+
+	candidates := getCandidatesFromSdp(offer)
+	index := 0
+	for _, candidate := range candidates {
+		body := make(map[string]interface{})
+		subBody := make(map[string]interface{})
+		subBody["candidate"] = candidate
+		subBody["sdpMLineIndex"] = index
+		subBody["sdmMid"] = "sdp"
+		body["candidate"] = subBody
+		requestRawMsg := make(map[string]interface{})
+		requestRawMsg["P-Asserted-Identity"] = r.local
+		requestRawMsg["RouterMessage"] = true
+
+		request := &rtclib.JSIP{
+			Type:       rtclib.INFO,
+			RequestURI: r.remote,
+			From:       feed.display,
+			To:         rtcRoom,
+			DialogueID: id,
+			Body:       body,
+			RawMsg:     requestRawMsg,
+		}
+		rtclib.SendJsonSIPMsg(nil, request)
+	}
+	if len(candidates) > 0 {
+		body := make(map[string]interface{})
+		subBody := make(map[string]interface{})
+		subBody["completed"] = true
+		body["candidate"] = subBody
+		requestRawMsg := make(map[string]interface{})
+		requestRawMsg["P-Asserted-Identity"] = r.local
+		requestRawMsg["RouterMessage"] = true
+
+		request := &rtclib.JSIP{
+			Type:       rtclib.INFO,
+			RequestURI: r.remote,
+			From:       feed.display,
+			To:         rtcRoom,
+			DialogueID: id,
+			Body:       body,
+			RawMsg:     requestRawMsg,
+		}
+		rtclib.SendJsonSIPMsg(nil, request)
+	}
+
+	listener := routerLis{
+		rou:        r,
+		hid:        hid,
+		feed:       feed,
+		dialogueID: id,
+		rtcRoom:    rtcRoom,
+	}
+
+	for {
+		select {
+		case <-r.close:
+			return
+		case msg := <-msgChan:
+			if !listener.messageHandle(msg) {
+				log.Printf("listen(r): process `%d` quit", hid)
+				return
+			}
+		}
+	}
 }
 
-func completeCandidate(j *janus.Janus, sid uint64, hid uint64) {
-    janusSess, _ := j.Session(sid)
-    tid := janusSess.NewTransaction()
+func (l *routerLis) messageHandle(msg message) bool {
+	r := l.rou
+	switch msg.desc {
+	case "jsip":
+		jsip := msg.content.(*rtclib.JSIP)
+		switch jsip.Type {
+		case rtclib.INVITE:
+			if jsip.Code == 0 {
+				log.Printf("listen(r): unexpected INVITE msg `%+v`", jsip)
+				return false
+			}
+			answer, err := jsip.Body.(*simplejson.Json).Get("sdp").String()
+			if err != nil {
+				log.Printf("listen(r): no sdp in INVITE response `%+v`", jsip)
+				return false
+			}
+			start(r.janusConn, r.sid, l.hid, l.feed.room, answer)
 
-    msg := make(map[string]interface{})
-    candidate := make(map[string]interface{})
-    candidate["completed"] = true
-    msg["janus"] = "trickle"
-    msg["session_id"] = sid
-    msg["handle_id"] = hid
-    msg["transaction"] = tid
-    msg["candidate"] = candidate
+			requestRawMsg := make(map[string]interface{})
+			requestRawMsg["P-Asserted-Identity"] = r.local
+			requestRawMsg["RouterMessage"] = true
+			relatedID := json.Number(strconv.FormatUint(jsip.CSeq, 10))
+			requestRawMsg["RelatedID"] = relatedID
+			response := &rtclib.JSIP{
+				Type:       rtclib.ACK,
+				RequestURI: r.remote,
+				From:       jsip.To,
+				To:         jsip.From,
+				DialogueID: jsip.DialogueID,
+				RawMsg:     requestRawMsg,
+			}
+			rtclib.SendJsonSIPMsg(nil, response)
+			return true
+		case rtclib.INFO:
+			if jsip.Code != 0 {
+				return true
+			}
+			body := jsip.Body.(*simplejson.Json)
+			candidateJson, exist := body.CheckGet("candidate")
+			if exist == false {
+				/* Now the info only transport candidate */
+				log.Printf("listen: not found candidate from INFO msg")
+				return false
+			}
 
-    j.Send(msg)
-    reqChan, ok := janusSess.MsgChan(tid)
-    if !ok {
-        log.Printf("completeCandidate: can't find channel for tid %s", tid)
-    }
+			completed, err := candidateJson.Get("completed").Bool()
+			if err == nil && completed == true {
+				completeCandidate(r.janusConn, r.sid, l.hid)
+			} else {
+				date, _ := candidateJson.Get("candidate").String()
+				mid, _ := candidateJson.Get("sdpMid").String()
+				index, _ := candidateJson.Get("sdpMLineIndex").Uint64()
+				candidate(r.janusConn, r.sid, l.hid, index, date, mid)
+			}
 
-    req := <- reqChan
-    log.Printf("completeCandidate: receive from channel: %s", req)
+			rawMsg := make(map[string]interface{})
+			rawMsg["P-Asserted-Identity"] = r.local
+			rawMsg["RouterMessage"] = true
+			response := &rtclib.JSIP{
+				Type:       rtclib.INFO,
+				Code:       200,
+				From:       jsip.To,
+				To:         jsip.From,
+				CSeq:       jsip.CSeq,
+				DialogueID: jsip.DialogueID,
+				RawMsg:     rawMsg,
+			}
+			rtclib.SendJsonSIPMsg(nil, response)
+			return true
+		case rtclib.BYE:
+			detach(r.janusConn, r.sid, l.hid)
+			return false
+		}
+	case "notifyUnpublish":
+		log.Printf("listen: handle `%d` recv unpublish", l.hid)
+		detach(r.janusConn, r.sid, l.hid)
+
+		rawMsg := make(map[string]interface{})
+		rawMsg["P-Asserted-Identity"] = r.local
+		rawMsg["RouterMessage"] = true
+		request := &rtclib.JSIP{
+			Type:       rtclib.BYE,
+			RequestURI: r.remote,
+			From:       l.feed.display,
+			To:         l.rtcRoom,
+			DialogueID: l.dialogueID,
+			RawMsg:     rawMsg,
+		}
+
+		rtclib.SendJsonSIPMsg(nil, request)
+		return false
+	}
+	return false
 }
 
-func start(j *janus.Janus, sid uint64, hid uint64, room uint64, sdp string) {
-    janusSess, _ := j.Session(sid)
-    tid := janusSess.NewTransaction()
-
-    msg := make(map[string]interface{})
-    body := make(map[string]interface{})
-    jsep := make(map[string]interface{})
-    body["request"] = "start"
-    body["room"] = room
-    jsep["type"] = "answer"
-    jsep["sdp"] = sdp
-    msg["janus"] = "message"
-    msg["transaction"] = tid
-    msg["session_id"] = sid
-    msg["handle_id"] = hid
-    msg["body"] = body
-    msg["jsep"] = jsep
-
-    j.Send(msg)
-    reqChan, ok := janusSess.MsgChan(tid)
-    if !ok {
-        log.Printf("start: can't find channel for tid %s", tid)
-    }
-
-    for {
-        req := <- reqChan
-        switch gjson.GetBytes(req, "janus").String() {
-        case "ack":
-            log.Printf("start: receive ack")
-        case "error":
-            log.Printf("start: receive err msg `%s`", req)
-            return
-        case "event":
-            log.Printf("start: receive success msg `%s`", req)
-            return
-        }
-    }
+func (r *router) notifyFeed(feed feed) {
+	msg := message{desc: "notifyFeed", content: feed}
+	go sendMessage(msg, r.msgChan)
 }
 
-func detach(j *janus.Janus, sid uint64, hid uint64) {
-    janusSess, _ := j.Session(sid)
-    tid := janusSess.NewTransaction()
-
-    msg := make(map[string]interface{})
-    msg["janus"] = "detach"
-    msg["transaction"] = tid
-    msg["session_id"] = sid
-    msg["handle_id"] = hid
-
-    j.Send(msg)
-    reqChan, ok := janusSess.MsgChan(tid)
-    if !ok {
-        log.Printf("detach: can't find channel for tid %s", tid)
-        return
-    }
-
-    req := <- reqChan
-    if gjson.GetBytes(req, "janus").String() != "success" {
-        log.Printf("detach: failed, fail message: `%s`", req)
-        return
-    }
-    log.Printf("detach: detach handle `%d` from `%d` success", hid, sid)
+func (r *router) notifyUnpublish(feed feed) {
+	msg := message{desc: "notifyUnpublish", content: feed}
+	go sendMessage(msg, r.msgChan)
 }
 
-func getFirstCandidateFromSdp(sdp string) string {
-    for _, sdpItem := range strings.Split(sdp, "\r\n") {
-        pair := strings.SplitN(sdpItem, "=", 2)
-        if (len(pair) != 2) {
-            continue
-        }
-
-        valuePair := strings.SplitN(pair[1], ":", 2)
-        if len(valuePair) != 2{
-            continue
-        }
-
-        if valuePair[0] != "candidate" {
-            continue
-        }
-
-        log.Printf(
-            "getFirstCandidateFromSdp: find candidate `%s` from line `%s`",
-            valuePair[1], sdpItem)
-        return valuePair[1]
-    }
-
-    log.Printf("getFirstCandidateFromSdp: not found candidate from sdp `%s`",
-               sdp)
-    return ""
+func (r *router) registerPublisher(id string, feed feed) {
+	publish := make(map[string]interface{})
+	publish["id"] = id
+	publish["feed"] = feed
+	msg := message{desc: "registerPublisher", content: publish}
+	go sendMessage(msg, r.msgChan)
 }
 
-func (r *router) handleDefaultMsg(j *janus.Janus, sid uint64) {
-    janusSess, _ := j.Session(sid)
-    msgChan := janusSess.DefaultMsgChan()
-
-    for {
-        msg := <- msgChan
-        switch gjson.GetBytes(msg, "janus").String() {
-        case "webrtcup":
-            log.Printf("webrtcup: stream(`%d`:`%d`) is up",
-                       gjson.GetBytes(msg, "session_id").Uint(),
-                       gjson.GetBytes(msg, "sender").Uint())
-        case "hangup":
-            log.Printf("hangup: stream(`%d`:`%d`) is hangup because `%s`",
-                       gjson.GetBytes(msg, "session_id").Uint(),
-                       gjson.GetBytes(msg, "sender").Uint(),
-                       gjson.GetBytes(msg, "reason").String())
-        case "event":
-            sender := gjson.GetBytes(msg, "sender").Uint()
-            if sender != r.localHid && sender != r.remoteHid {
-                log.Printf("event: ignore router msg `%s`", msg)
-                return
-            }
-            pluginData := gjson.GetBytes(msg, "plugindata")
-            if !pluginData.Exists() {
-                log.Printf("event: no plugindata for msg `%s`", msg)
-                break
-            }
-            data := pluginData.Get("data")
-            if !data.Exists() {
-                log.Printf("event: no data for msg `%s`", msg)
-                break
-            }
-            switch data.Get("videoroom").String() {
-            case "event":
-                if data.Get("publishers").Exists() {
-                    publishers := data.Get("publishers").Array()
-                    for _, publisher := range publishers {
-                        if r.getPublisher(publisher.Get("id").Uint()) {
-                            continue
-                        }
-                        switch sender {
-                        case r.localHid:
-                            go r.listenLocal(publisher.String())
-                        case r.remoteHid:
-                            go r.listenRemote(publisher.String())
-                        }
-                    }
-                } else if data.Get("unpublished").Exists() {
-                    unpublished := data.Get("unpublished").Uint()
-                    if r.getPublisher(unpublished) {
-                        r.delPublisher(unpublished)
-                    }
-                    listener := r.getListener(unpublished)
-                    if listener == nil {
-                        log.Printf("msg unpublish: id `%d` is not registered",
-                                   unpublished)
-                        break
-                    }
-                    if sender == r.localHid {
-                        detach(r.localConn, r.localSid, listener.listenHid)
-                        unpublish(r.remoteConn, r.remoteSid,
-                                  listener.publishHid)
-                        r.delListener(unpublished)
-                        break
-                    } else if sender == r.remoteHid {
-                        detach(r.remoteConn, r.remoteSid, listener.listenHid)
-                        unpublish(r.localConn, r.localSid, listener.publishHid)
-                        r.delListener(unpublished)
-                        break
-                    }
-                }
-            }
-        case "timeout":
-            // TODO: Destory session
-            log.Printf("timeout: session `%d` is timeout in janus server",
-                       gjson.GetBytes(msg, "session_id").Uint())
-            return
-        }
-    }
+func (r *router) notifyQuit(id string) {
+	msg := message{desc: "notifyQuit", content: id}
+	go sendMessage(msg, r.msgChan)
 }
 
-func (r *router) newRemoteSession() {
-    r.remoteSid = newJanusSession(r.remoteConn)
-    r.remoteHid = attachVideoroom(r.remoteConn, r.remoteSid)
+func (r *router) keepalive() {
+	// Just send keepalive per 30 second
+	timer := time.After(30 * time.Second)
 
-    go r.handleDefaultMsg(r.remoteConn, r.remoteSid)
-    go func() {
-        for {
-            /* just send keepalive per 30 second */
-            <- time.After(30*time.Second)
-            keepalive(r.remoteConn, r.remoteSid)
-            log.Printf("keepalive: router session `%d` send a keepalive",
-                       r.remoteSid)
-        }
-    } ()
-
-    log.Printf("newRemoteSession: new janus session `%d` success", r.remoteSid)
+	for {
+		select {
+		case <-timer:
+			log.Printf("keepalive: router `%d` send a keepalive", r.sid)
+			keepalive(r.janusConn, r.sid)
+			timer = time.After(30 * time.Second)
+		case <-r.close:
+			log.Printf("keepalive: router `%d` closed", r.sid)
+			return
+		}
+	}
 }
 
-func (r *router) newLocalSession() {
-    r.localSid = newJanusSession(r.localConn)
-    r.localHid = attachVideoroom(r.localConn, r.localSid)
-
-    go r.handleDefaultMsg(r.localConn, r.localSid)
-    go func() {
-        /* just send keepalive per 30 second */
-        <- time.After(30*time.Second)
-        keepalive(r.localConn, r.localSid)
-        log.Printf("keepalive: router session `%d` send a keepalive",
-                   r.localSid)
-    } ()
-    log.Printf("newLocalSession: new janus session `%d` success", r.localSid)
+func (r *router) finish() {
+	log.Printf("router: router for server `%s` finished", r.remote)
+	r.global.routers.Delete(r.remote)
+	close(r.close)
 }
 
-func (r *router) registerListener(id uint64, lHid uint64, pHid uint64) {
-    _, exist := r.listeners[id]
-    if exist {
-        log.Printf("registerListener: id `%d` already registered", id)
-        return
-    }
-    r.listeners[id] = newListener(id, lHid, pHid)
-    log.Printf("registerListener: id `%d` register success", id)
+func (r *router) getRoom(rtcRoom string) (uint64, bool) {
+	return r.global.getRoom(rtcRoom)
 }
 
-func (r *router) getListener(id uint64) *listener {
-    listener, exist := r.listeners[id]
-    if !exist {
-        return nil
-    }
-    return listener
+func (r *router) getRtcRoom(room uint64) (string, bool) {
+	return r.global.getRtcRoom(room)
 }
 
-func (r *router) delListener(id uint64) {
-    delete(r.listeners, id)
-}
-
-func (r *router) registerPublisher(id uint64) {
-    _, exist := r.publishers[id]
-    if exist {
-        log.Printf("registerPublisher: id `%d` already registered", id)
-        return
-    }
-    r.publishers[id] = true
-    log.Printf("registerPublisher: id `%d` register success")
-}
-
-func (r *router) getPublisher(id uint64) bool {
-    _, exist := r.publishers[id]
-    // if publisher exist, it's value only will be true, so just return exist
-    return exist
-}
-
-func (r *router) delPublisher(id uint64) {
-    delete(r.publishers, id)
-}
-
-func (r *router) listenRemote(publisher string) {
-    remoteHid := attachVideoroom(r.remoteConn, r.remoteSid)
-    id := gjson.Get(publisher, "id").Uint()
-    display := gjson.Get(publisher, "display").String()
-
-    offer := listen(r.remoteConn, r.remoteSid, remoteHid, r.remoteRoom, id,
-                    r.remotePrivateId)
-    remoteCandidate := getFirstCandidateFromSdp(offer)
-
-    localHid := attachVideoroom(r.localConn, r.localSid)
-    publisherMsg := publish(
-        r.localConn, r.localSid, localHid, r.localRoom, display)
-    r.registerPublisher(
-        gjson.GetBytes(publisherMsg, "plugindata.data.id").Uint())
-    answer := configure(r.localConn, r.localSid, localHid, offer)
-    localCandidate := getFirstCandidateFromSdp(answer)
-
-    start(r.remoteConn, r.remoteSid, remoteHid, r.remoteRoom, answer)
-    r.registerListener(id, remoteHid, localHid)
-
-    if remoteCandidate != "" {
-        candidate(r.localConn, r.localSid, localHid, remoteCandidate, "router",
-                  0)
-        completeCandidate(r.localConn, r.localSid, localHid)
-    }
-
-    if localCandidate != "" {
-        candidate(r.remoteConn, r.remoteSid, remoteHid, localCandidate,
-                  "router", 0)
-        completeCandidate(r.remoteConn, r.remoteSid, remoteHid)
-    }
-}
-
-func (r *router) listenLocal(publisher string) {
-    localHid := attachVideoroom(r.localConn, r.localSid)
-    id := gjson.Get(publisher, "id").Uint()
-    display := gjson.Get(publisher, "display").String()
-
-    offer := listen(r.localConn, r.localSid, localHid, r.localRoom, id,
-                    r.localPrivateId)
-    localCandidate := getFirstCandidateFromSdp(offer)
-
-    remoteHid := attachVideoroom(r.remoteConn, r.remoteSid)
-    publisherMsg := publish(
-        r.remoteConn, r.remoteSid, remoteHid, r.remoteRoom, display)
-    r.registerPublisher(
-        gjson.GetBytes(publisherMsg, "plugindata.data.id").Uint())
-    answer := configure(r.remoteConn, r.remoteSid, remoteHid, offer)
-    remoteCandidate := getFirstCandidateFromSdp(answer)
-
-    start(r.localConn, r.localSid, localHid, r.localRoom, answer)
-    r.registerListener(id, localHid, remoteHid)
-
-    if remoteCandidate != "" {
-        candidate(r.localConn, r.localSid, localHid, remoteCandidate, "router",
-                  0)
-        completeCandidate(r.localConn, r.localSid, localHid)
-    }
-
-    if localCandidate != "" {
-        candidate(r.remoteConn, r.remoteSid, remoteHid, localCandidate,
-                  "router", 0)
-        completeCandidate(r.remoteConn, r.remoteSid, remoteHid)
-    }
-}
-
-func (r *router) startRemote() {
-    publisherMsg := publish(r.remoteConn, r.remoteSid, r.remoteHid,
-                            r.remoteRoom, "route")
-    r.registerPublisher(
-        gjson.GetBytes(publisherMsg, "plugindata.data.id").Uint())
-    r.remotePrivateId = gjson.GetBytes(
-        publisherMsg, "plugindata.data.private_id").Uint()
-
-    publishers := gjson.GetBytes(
-        publisherMsg, "plugindata.data.publishers").Array()
-    for _, publisher := range publishers {
-        if r.getPublisher(publisher.Get("id").Uint()) {
-            continue
-        }
-        r.listenRemote(publisher.String())
-    }
-}
-
-func (r *router) startLocal() {
-    publisherMsg := publish(r.localConn, r.localSid, r.localHid, r.localRoom,
-                            "route")
-    r.registerPublisher(
-        gjson.GetBytes(publisherMsg, "plugindata.data.id").Uint())
-    r.localPrivateId = gjson.GetBytes(
-        publisherMsg, "plugindata.data.private_id").Uint()
-
-    publishers := gjson.GetBytes(
-        publisherMsg, "plugindata.data.publishers").Array()
-    for _, publisher := range publishers {
-        if r.getPublisher(publisher.Get("id").Uint()) {
-            continue
-        }
-        r.listenLocal(publisher.String())
-    }
+func (r *router) newDialogueID() string {
+	u1, _ := uuid.NewV4()
+	return r.local + r.remote + u1.String()
 }
