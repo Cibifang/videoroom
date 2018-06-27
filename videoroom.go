@@ -12,8 +12,8 @@ import (
 
 type globalCtx struct {
 	rClient  *redis.Client
-	sessions sync.Map
 	routers  sync.Map
+	handlers sync.Map
 }
 
 type Config struct {
@@ -39,11 +39,11 @@ func GetInstance(task *rtclib.Task) rtclib.SLP {
 	}
 
 	if task.Ctx.Body == nil {
-		var sessions sync.Map
 		var routers sync.Map
+		var handlers sync.Map
 		ctx := &globalCtx{
-			sessions: sessions,
 			routers:  routers,
+			handlers: handlers,
 		}
 
 		ctx.rClient = redis.NewClient(
@@ -84,14 +84,27 @@ func (vr *Videoroom) Process(jsip *rtclib.JSIP) {
 	log.Printf("videoroom: recv msg: %+v", jsip)
 	log.Printf("videoroom: The config: %+v", vr.config)
 
+	msg := message{desc: "jsip", content: jsip}
+
+	id := jsip.DialogueID
+	process, exist := vr.ctx.handlers.Load(id)
+	if exist {
+		sendMessage(msg, process.(handler).MsgChan())
+		return
+	}
+
+	if jsip.Type != rtclib.INVITE || jsip.Code != 0 {
+		log.Printf("videoroom: no process for id `%s`", id)
+		return
+	}
+
 	PAI, exist := jsip.RawMsg["P-Asserted-Identity"]
 	if !exist {
-		log.Printf("videoroom: no P-Asserted-Identity in message, ignore")
+		log.Printf("videoroom: no P-Asserted-Identity in message, quit")
+		vr.finish()
 		return
 	}
 	user, _ := PAI.(string)
-
-	msg := message{desc: "jsip", content: jsip}
 
 	if jsip.RequestURI == rtclib.Realm() {
 		fromRouter, exist := jsip.RawMsg["RouterMessage"]
@@ -103,56 +116,23 @@ func (vr *Videoroom) Process(jsip *rtclib.JSIP) {
 				return
 			}
 			router := cachedRouter.(*router)
-			sendMessage(msg, router.msgChan)
+			vr.ctx.handlers.Store(id, router)
+			sendMessage(msg, router.MsgChan())
 			return
 		}
 		log.Printf("videoroom: msg is sent from router")
 	}
 
-	session, exist := vr.cachedSession(user)
-	if exist {
-		sendMessage(msg, session.msgChan)
-		return
-	}
-
-	if jsip.Type != rtclib.INVITE || jsip.Code != 0 {
-		log.Printf("videoroom: no session for user `%s`", user)
-	}
-
-	vr.newSession(user)
-	session, exist = vr.cachedSession(user)
-	if !exist {
+	session := newSession(vr, user)
+	if session == nil {
 		log.Printf("videoroom: create session for user `%s` failed", user)
 		vr.finish()
 		return
 	}
+	vr.ctx.handlers.Store(id, session)
 
 	session.id = jsip.RequestURI
-	sendMessage(msg, session.msgChan)
-}
-
-func (vr *Videoroom) newSession(user string) {
-	session := newSession(vr, user)
-	if session == nil {
-		return
-	}
-
-	_, ok := vr.ctx.sessions.LoadOrStore(user, session)
-	if !ok {
-		log.Printf("videoroom: session for user `%s` is rewrited", user)
-	}
-}
-
-func (vr *Videoroom) cachedSession(user string) (*session, bool) {
-	s, exist := vr.ctx.sessions.Load(user)
-	if !exist {
-		return nil, exist
-	}
-	return s.(*session), exist
-}
-
-func (vr *Videoroom) deleteSession(user string) {
-	vr.ctx.sessions.Delete(user)
+	sendMessage(msg, session.MsgChan())
 }
 
 func (vr *Videoroom) finish() {

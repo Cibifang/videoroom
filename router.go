@@ -63,6 +63,10 @@ func newRouter(remote string, conn *janus.Janus, ctx *globalCtx) *router {
 	return router
 }
 
+func (r *router) MsgChan() chan message {
+	return r.msgChan
+}
+
 func (r *router) new(janusRoom uint64) {
 	hid := attachVideoroom(r.janusConn, r.sid)
 	publishMsg := publish(r.janusConn, r.sid, hid, janusRoom, "router")
@@ -181,6 +185,7 @@ func (r *router) messageHandle(msg message) {
 		msgChan := make(chan message)
 		r.process[id] = msgChan
 		r.feeds[feed] = id
+		r.global.handlers.Store(id, r)
 		go r.listen(msgChan, id, feed)
 	case "notifyUnpublish":
 		unpub := msg.content.(feed)
@@ -209,6 +214,7 @@ func (r *router) messageHandle(msg message) {
 	case "notifyQuit":
 		id := msg.content.(string)
 		delete(r.process, id)
+		r.global.handlers.Delete(id)
 		// TODO: Divide Pub and Listen to finish.
 		if len(r.process) == 0 {
 			log.Printf("messageHandle: all process is done")
