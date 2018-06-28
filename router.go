@@ -324,7 +324,7 @@ func (pub *routerPub) messageHandle(msg message) bool {
 					Body:       body,
 					RawMsg:     requestRawMsg,
 				}
-				rtclib.SendJsonSIPMsg(nil, request)
+				rtclib.SendMsg(request)
 			}
 			if len(candidates) > 0 {
 				body := make(map[string]interface{})
@@ -344,7 +344,7 @@ func (pub *routerPub) messageHandle(msg message) bool {
 					Body:       body,
 					RawMsg:     requestRawMsg,
 				}
-				rtclib.SendJsonSIPMsg(nil, request)
+				rtclib.SendMsg(request)
 			}
 
 			responseBody := make(map[string]interface{})
@@ -365,7 +365,7 @@ func (pub *routerPub) messageHandle(msg message) bool {
 				Body:       responseBody,
 			}
 
-			rtclib.SendJsonSIPMsg(nil, response)
+			rtclib.SendMsg(response)
 			return true
 		case rtclib.INFO:
 			if jsip.Code != 0 {
@@ -401,7 +401,7 @@ func (pub *routerPub) messageHandle(msg message) bool {
 				DialogueID: jsip.DialogueID,
 				RawMsg:     responseRawMsg,
 			}
-			rtclib.SendJsonSIPMsg(nil, response)
+			rtclib.SendMsg(response)
 			return true
 		case rtclib.BYE:
 			unpublish(r.janusConn, r.sid, pub.hid)
@@ -446,7 +446,7 @@ func (r *router) listen(msgChan chan message, id string, feed feed) {
 		RawMsg:     rawMsg,
 		Body:       body,
 	}
-	rtclib.SendJSIPReq(request, id)
+	rtclib.SendMsg(request)
 
 	candidates := getCandidatesFromSdp(offer)
 	index := 0
@@ -470,7 +470,7 @@ func (r *router) listen(msgChan chan message, id string, feed feed) {
 			Body:       body,
 			RawMsg:     requestRawMsg,
 		}
-		rtclib.SendJsonSIPMsg(nil, request)
+		rtclib.SendMsg(request)
 	}
 	if len(candidates) > 0 {
 		body := make(map[string]interface{})
@@ -490,7 +490,7 @@ func (r *router) listen(msgChan chan message, id string, feed feed) {
 			Body:       body,
 			RawMsg:     requestRawMsg,
 		}
-		rtclib.SendJsonSIPMsg(nil, request)
+		rtclib.SendMsg(request)
 	}
 
 	listener := routerLis{
@@ -545,7 +545,7 @@ func (l *routerLis) messageHandle(msg message) bool {
 				DialogueID: jsip.DialogueID,
 				RawMsg:     requestRawMsg,
 			}
-			rtclib.SendJsonSIPMsg(nil, response)
+			rtclib.SendMsg(response)
 			return true
 		case rtclib.INFO:
 			if jsip.Code != 0 {
@@ -581,7 +581,8 @@ func (l *routerLis) messageHandle(msg message) bool {
 				DialogueID: jsip.DialogueID,
 				RawMsg:     rawMsg,
 			}
-			rtclib.SendJsonSIPMsg(nil, response)
+
+			rtclib.SendMsg(response)
 			return true
 		case rtclib.BYE:
 			detach(r.janusConn, r.sid, l.hid)
@@ -603,7 +604,7 @@ func (l *routerLis) messageHandle(msg message) bool {
 			RawMsg:     rawMsg,
 		}
 
-		rtclib.SendJsonSIPMsg(nil, request)
+		rtclib.SendMsg(request)
 		return false
 	}
 	return false

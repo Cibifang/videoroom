@@ -315,7 +315,7 @@ func (pub *publisher) messageHandle(msg message) bool {
 				Body:       body,
 			}
 
-			rtclib.SendJsonSIPMsg(nil, response)
+			rtclib.SendMsg(response)
 		case rtclib.INFO:
 			if jsip.Code != 0 {
 				return true
@@ -349,7 +349,7 @@ func (pub *publisher) messageHandle(msg message) bool {
 				DialogueID: jsip.DialogueID,
 				RawMsg:     rawMsg,
 			}
-			rtclib.SendJsonSIPMsg(nil, response)
+			rtclib.SendMsg(response)
 			return true
 		case rtclib.BYE:
 			unpublish(s.janusConn, s.sid, pub.hid)
@@ -384,7 +384,7 @@ func (pub *publisher) messageHandle(msg message) bool {
 			RawMsg:     requestRawMsg,
 		}
 
-		rtclib.SendJsonSIPMsg(nil, request)
+		rtclib.SendMsg(request)
 		return false
 	}
 	return true
@@ -443,7 +443,7 @@ func (l *listener) messageHandle(msg message) bool {
 			response.RawMsg["RelatedID"] = relatedID
 			response.RawMsg["P-Asserted-Identity"] = s.id
 
-			rtclib.SendJsonSIPMsg(nil, response)
+			rtclib.SendMsg(response)
 			return true
 		case rtclib.INFO:
 			if jsip.Code != 0 {
@@ -478,7 +478,7 @@ func (l *listener) messageHandle(msg message) bool {
 				DialogueID: jsip.DialogueID,
 				RawMsg:     rawMsg,
 			}
-			rtclib.SendJsonSIPMsg(nil, response)
+			rtclib.SendMsg(response)
 			return true
 		case rtclib.BYE:
 			detach(s.janusConn, s.sid, l.hid)
@@ -499,7 +499,7 @@ func (l *listener) messageHandle(msg message) bool {
 			RawMsg:     requestRawMsg,
 		}
 
-		rtclib.SendJsonSIPMsg(nil, request)
+		rtclib.SendMsg(request)
 		return false
 	case "notifyHangup":
 		hangId := msg.content.(uint64)
@@ -521,7 +521,7 @@ func (l *listener) messageHandle(msg message) bool {
 			RawMsg:     requestRawMsg,
 		}
 
-		rtclib.SendJsonSIPMsg(nil, request)
+		rtclib.SendMsg(request)
 		return false
 	}
 	return true
@@ -561,7 +561,7 @@ func (s *session) listen(msgChan chan message, id string, feed feed) {
 		RawMsg:     rawMsg,
 		Body:       body,
 	}
-	rtclib.SendJSIPReq(request, id)
+	rtclib.SendMsg(request)
 
 	listener := listener{
 		sess:       s,
