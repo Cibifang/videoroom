@@ -273,6 +273,10 @@ func (pub *publisher) messageHandle(msg message) bool {
 		jsip := msg.content.(*rtclib.JSIP)
 		switch jsip.Type {
 		case rtclib.INVITE:
+			if jsip.Body == nil {
+				log.Printf("publish: unexpected INVITE msg `%+v`", jsip)
+				return false
+			}
 			pub.rtcRoom = jsip.To
 			display := jsip.From
 			offer, err := jsip.Body.(*simplejson.Json).Get("sdp").String()
@@ -327,6 +331,10 @@ func (pub *publisher) messageHandle(msg message) bool {
 		case rtclib.INFO:
 			if jsip.Code != 0 {
 				return true
+			}
+			if jsip.Body == nil {
+				log.Printf("publish: unexpected INFO msg `%+v`", jsip)
+				return false
 			}
 			body := jsip.Body.(*simplejson.Json)
 			date, exist := body.CheckGet("candidate")
@@ -428,7 +436,7 @@ func (l *listener) messageHandle(msg message) bool {
 		jsip := msg.content.(*rtclib.JSIP)
 		switch jsip.Type {
 		case rtclib.INVITE:
-			if jsip.Code == 0 {
+			if jsip.Code == 0 || jsip.Body == nil {
 				log.Printf("listen: unexpected INVITE msg `%+v`", jsip)
 				return false
 			}
@@ -456,6 +464,10 @@ func (l *listener) messageHandle(msg message) bool {
 		case rtclib.INFO:
 			if jsip.Code != 0 {
 				return true
+			}
+			if jsip.Body == nil {
+				log.Printf("listen: unexpected INFO msg `%+v`", jsip)
+				return false
 			}
 			body := jsip.Body.(*simplejson.Json)
 			candidateJson, exist := body.CheckGet("candidate")
