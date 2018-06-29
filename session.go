@@ -80,9 +80,10 @@ func (s *session) MsgChan() chan message {
 
 func (s *session) finish() {
 	log.Printf("session: session for user `%s` finished", s.user)
-	s.vr.finish()
-	go destroy(s.janusConn, s.sid)
 	close(s.close)
+	s.vr.finish()
+	destroy(s.janusConn, s.sid)
+	s.janusConn.Close()
 }
 
 func (s *session) messageHandle(msg message) {
