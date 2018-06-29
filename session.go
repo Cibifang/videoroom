@@ -214,6 +214,13 @@ func (s *session) janusMessage(msg []byte) {
 			}
 			s.notifyUnpublish(feed)
 		}
+	case "media":
+		receiving := gjson.GetBytes(msg, "receiving").Bool()
+		if receiving {
+			return
+		}
+		log.Println("janusMessage: media receiving is false")
+		fallthrough
 	case "hangup":
 		hid := gjson.GetBytes(msg, "sender").Uint()
 		msg := message{desc: "notifyHangup", content: hid}
