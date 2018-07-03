@@ -38,32 +38,34 @@ func GetInstance(task *rtclib.Task) rtclib.SLP {
 		log.Println("Videoroom load config failed")
 	}
 
-	if task.Ctx.Body == nil {
-		var routers sync.Map
-		var handlers sync.Map
-		ctx := &globalCtx{
-			routers:  routers,
-			handlers: handlers,
-		}
+	return vr
+}
 
-		ctx.rClient = redis.NewClient(
-			&redis.Options{
-				Addr:     vr.config.RedisAddr,
-				Password: vr.config.RedisPassword,
-				DB:       int(vr.config.RedisDB),
-			})
-		pong, err := ctx.rClient.Ping().Result()
-		if err != nil {
-			log.Println("Init videoroom: ping redis err: ", err)
-		}
-		log.Println("Init videoroom: ping redis, response: ", pong)
-
-		task.Ctx.Body = ctx
-		log.Printf("Init videoroom ctx, ctx = %+v", task.Ctx.Body)
+func (vr *Videoroom) NewSLPCtx() interface{} {
+	var routers sync.Map
+	var handlers sync.Map
+	rClient := redis.NewClient(
+		&redis.Options{
+			Addr:     vr.config.RedisAddr,
+			Password: vr.config.RedisPassword,
+			DB:       int(vr.config.RedisDB),
+		})
+	if _, err := rClient.Ping().Result(); err != nil {
+		log.Println("Init Videoroom ctx: ping redis err: ", err)
 	}
 
-	vr.ctx = task.Ctx.Body.(*globalCtx)
-	return vr
+	ctx := &globalCtx{
+		routers:  routers,
+		handlers: handlers,
+		rClient:  rClient,
+	}
+	log.Printf("Init Videoroom ctx: ctx = %+v", ctx)
+	return ctx
+}
+
+func (vr *Videoroom) OnLoad(jsip *rtclib.JSIP) {
+	vr.finish()
+	return
 }
 
 func (vr *Videoroom) loadConfig() bool {
@@ -83,6 +85,7 @@ func (vr *Videoroom) loadConfig() bool {
 func (vr *Videoroom) Process(jsip *rtclib.JSIP) {
 	log.Printf("videoroom: recv msg: %+v", jsip)
 	log.Printf("videoroom: The config: %+v", vr.config)
+	vr.ctx = vr.task.GetCtx().(*globalCtx)
 
 	msg := message{desc: "jsip", content: jsip}
 
