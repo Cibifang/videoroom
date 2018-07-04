@@ -82,7 +82,6 @@ func (s *session) finish() {
 	log.Printf("session: session for user `%s` finished", s.user)
 	close(s.close)
 	s.vr.finish()
-	destroy(s.janusConn, s.sid)
 	s.janusConn.Close()
 }
 
