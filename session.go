@@ -37,11 +37,13 @@ type publisher struct {
 	hid        uint64
 	rtcRoom    string
 	dialogueID string
+	init       bool
 }
 
 type listener struct {
 	sess       *session
 	hid        uint64
+	rtcRoom    string
 	feed       feed
 	dialogueID string
 }
@@ -213,6 +215,15 @@ func (s *session) janusMessage(msg []byte) {
 				pid:  data.Get("unpublished").Uint(),
 			}
 			s.notifyUnpublish(feed)
+		} else if data.Get("configured").Exists() {
+			jsep := gjson.GetBytes(msg, "jsep")
+			if !jsep.Exists() {
+				return
+			}
+			notifyMsg := message{desc: "notifyRenegotiation", content: msg}
+			for _, msgChan := range s.process {
+				go sendMessage(notifyMsg, msgChan)
+			}
 		}
 	case "media":
 		receiving := gjson.GetBytes(msg, "receiving").Bool()
@@ -276,32 +287,35 @@ func (pub *publisher) messageHandle(msg message) bool {
 				log.Printf("publish: unexpected INVITE msg `%+v`", jsip)
 				return false
 			}
-			pub.rtcRoom = jsip.To
-			display := jsip.From
 			offer, err := jsip.Body.(*simplejson.Json).Get("sdp").String()
 			if err != nil {
 				log.Printf("publish: no sdp in message `%+v`", jsip)
 				return false
 			}
 
-			room := s.getRoom(pub.rtcRoom, s.sid, pub.hid)
-			publishMsg := publish(s.janusConn, s.sid, pub.hid, room, display)
-			if publishMsg == nil {
-				return false
-			}
-
-			data := gjson.GetBytes(publishMsg, "plugindata.data")
-			pid := data.Get("id").Uint()
-			f := feed{room: room, pid: pid, display: display}
-			s.registerPublisher(f)
-			publishers := data.Get("publishers").Array()
-			for _, pubMsg := range publishers {
-				f := feed{
-					room:    room,
-					pid:     pubMsg.Get("id").Uint(),
-					display: pubMsg.Get("display").String(),
+			if pub.init == false {
+				pub.rtcRoom = jsip.To
+				display := jsip.From
+				room := s.getRoom(pub.rtcRoom, s.sid, pub.hid)
+				publishMsg := publish(s.janusConn, s.sid, pub.hid, room, display)
+				if publishMsg == nil {
+					return false
 				}
-				s.notifyFeed(f)
+
+				data := gjson.GetBytes(publishMsg, "plugindata.data")
+				pid := data.Get("id").Uint()
+				f := feed{room: room, pid: pid, display: display}
+				s.registerPublisher(f)
+				publishers := data.Get("publishers").Array()
+				for _, pubMsg := range publishers {
+					f := feed{
+						room:    room,
+						pid:     pubMsg.Get("id").Uint(),
+						display: pubMsg.Get("display").String(),
+					}
+					s.notifyFeed(f)
+				}
+				pub.init = true
 			}
 
 			answer := configure(s.janusConn, s.sid, pub.hid, offer)
@@ -542,6 +556,31 @@ func (l *listener) messageHandle(msg message) bool {
 
 		rtclib.SendMsg(request)
 		return false
+	case "notifyRenegotiation":
+		content := msg.content.([]byte)
+		sender := gjson.GetBytes(content, "sender").Uint()
+		if l.hid != sender {
+			return true
+		}
+		offer := gjson.GetBytes(content, "jsep.sdp").String()
+
+		body := make(map[string]interface{})
+		body["type"] = "offer"
+		body["sdp"] = offer
+		body["room"] = l.rtcRoom
+		rawMsg := make(map[string]interface{})
+		rawMsg["P-Asserted-Identity"] = s.id
+
+		request := &rtclib.JSIP{
+			Type:       rtclib.INVITE,
+			RequestURI: s.user,
+			From:       l.feed.display,
+			To:         s.user,
+			DialogueID: l.dialogueID,
+			RawMsg:     rawMsg,
+			Body:       body,
+		}
+		rtclib.SendMsg(request)
 	}
 	return true
 }
@@ -585,6 +624,7 @@ func (s *session) listen(msgChan chan message, id string, feed feed) {
 	listener := listener{
 		sess:       s,
 		hid:        hid,
+		rtcRoom:    rtcRoom,
 		feed:       feed,
 		dialogueID: id,
 	}

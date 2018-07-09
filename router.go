@@ -34,6 +34,8 @@ type routerPub struct {
 	rou        *router
 	hid        uint64
 	dialogueID string
+	rtcRoom    string
+	init       bool
 }
 
 type routerLis struct {
@@ -141,6 +143,14 @@ func (r *router) janusMessage(msg []byte) {
 				pid:  data.Get("unpublished").Uint(),
 			}
 			r.notifyUnpublish(feed)
+		} else if data.Get("configured").Exists() {
+			if !gjson.GetBytes(msg, "jsep").Exists() {
+				return
+			}
+			notifyMsg := message{desc: "notifyRenegotiation", content: msg}
+			for _, msgChan := range r.process {
+				go sendMessage(notifyMsg, msgChan)
+			}
 		}
 	}
 }
@@ -265,40 +275,43 @@ func (pub *routerPub) messageHandle(msg message) bool {
 				return false
 			}
 			body := jsip.Body.(*simplejson.Json)
-			rtcRoom, err := body.Get("room").String()
-			if err != nil {
-				log.Printf("publish(r): not room in message `%+v`", jsip)
-				return false
-			}
-			display := jsip.From
 			offer, err := body.Get("sdp").String()
 			if err != nil {
 				log.Printf("publish(r): not sdp in message `%+v`", jsip)
 				return false
 			}
 
-			room, exist := r.getRoom(rtcRoom)
-			if !exist {
-				log.Printf("publish(r): no room record for `%s`", rtcRoom)
-				return false
-			}
-			publishMsg := publish(r.janusConn, r.sid, pub.hid, room, display)
-			if publishMsg == nil {
-				return false
-			}
-
-			data := gjson.GetBytes(publishMsg, "plugindata.data")
-			pid := data.Get("id").Uint()
-			f := feed{room: room, pid: pid, display: display}
-			r.registerPublisher(pub.dialogueID, f)
-			publishers := data.Get("publishers").Array()
-			for _, pubMsg := range publishers {
-				f := feed{
-					room:    room,
-					pid:     pubMsg.Get("id").Uint(),
-					display: pubMsg.Get("display").String(),
+			if pub.init == false {
+				pub.rtcRoom, err = body.Get("room").String()
+				if err != nil {
+					log.Printf("publish(r): not room in message `%+v`", jsip)
+					return false
 				}
-				r.notifyFeed(f)
+				display := jsip.From
+				room, exist := r.getRoom(pub.rtcRoom)
+				if !exist {
+					log.Printf("publish(r): no room record for `%s`", pub.rtcRoom)
+					return false
+				}
+				publishMsg := publish(r.janusConn, r.sid, pub.hid, room, display)
+				if publishMsg == nil {
+					return false
+				}
+
+				data := gjson.GetBytes(publishMsg, "plugindata.data")
+				pid := data.Get("id").Uint()
+				f := feed{room: room, pid: pid, display: display}
+				r.registerPublisher(pub.dialogueID, f)
+				publishers := data.Get("publishers").Array()
+				for _, pubMsg := range publishers {
+					f := feed{
+						room:    room,
+						pid:     pubMsg.Get("id").Uint(),
+						display: pubMsg.Get("display").String(),
+					}
+					r.notifyFeed(f)
+				}
+				pub.init = true
 			}
 
 			answer := configure(r.janusConn, r.sid, pub.hid, offer)
@@ -323,7 +336,7 @@ func (pub *routerPub) messageHandle(msg message) bool {
 					Type:       rtclib.INFO,
 					RequestURI: r.remote,
 					From:       jsip.To,
-					To:         rtcRoom,
+					To:         pub.rtcRoom,
 					DialogueID: jsip.DialogueID,
 					Body:       body,
 					RawMsg:     requestRawMsg,
@@ -343,7 +356,7 @@ func (pub *routerPub) messageHandle(msg message) bool {
 					Type:       rtclib.INFO,
 					RequestURI: r.remote,
 					From:       jsip.To,
-					To:         rtcRoom,
+					To:         pub.rtcRoom,
 					DialogueID: jsip.DialogueID,
 					Body:       body,
 					RawMsg:     requestRawMsg,
@@ -362,7 +375,7 @@ func (pub *routerPub) messageHandle(msg message) bool {
 				Type:       rtclib.INVITE,
 				Code:       200,
 				From:       jsip.To,
-				To:         rtcRoom,
+				To:         pub.rtcRoom,
 				CSeq:       jsip.CSeq,
 				DialogueID: jsip.DialogueID,
 				RawMsg:     responseRawMsg,
@@ -618,6 +631,31 @@ func (l *routerLis) messageHandle(msg message) bool {
 
 		rtclib.SendMsg(request)
 		return false
+	case "notifyRenegotiation":
+		content := msg.content.([]byte)
+		sender := gjson.GetBytes(content, "sender").Uint()
+		if l.hid != sender {
+			return true
+		}
+		offer := gjson.GetBytes(content, "jsep.sdp").String()
+
+		body := make(map[string]interface{})
+		body["type"] = "offer"
+		body["sdp"] = offer
+		rawMsg := make(map[string]interface{})
+		rawMsg["P-Asserted-Identity"] = r.local
+		rawMsg["RouterMessage"] = true
+
+		request := &rtclib.JSIP{
+			Type:       rtclib.INVITE,
+			RequestURI: r.remote,
+			From:       l.feed.display,
+			To:         l.rtcRoom,
+			DialogueID: l.dialogueID,
+			RawMsg:     rawMsg,
+			Body:       body,
+		}
+		rtclib.SendMsg(request)
 	}
 	return false
 }
