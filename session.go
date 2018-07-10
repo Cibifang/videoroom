@@ -38,6 +38,8 @@ type publisher struct {
 	rtcRoom    string
 	dialogueID string
 	init       bool
+	video      bool
+	audio      bool
 }
 
 type listener struct {
@@ -46,6 +48,8 @@ type listener struct {
 	rtcRoom    string
 	feed       feed
 	dialogueID string
+	video      bool
+	audio      bool
 }
 
 type feed struct {
@@ -178,6 +182,12 @@ func (s *session) messageHandle(msg message) {
 				break
 			}
 		}
+	case "notifyClose":
+		id := msg.content.(string)
+		msgChan, exist := s.process[id]
+		if exist {
+			go sendMessage(msg, msgChan)
+		}
 	}
 }
 
@@ -226,12 +236,10 @@ func (s *session) janusMessage(msg []byte) {
 			}
 		}
 	case "media":
-		receiving := gjson.GetBytes(msg, "receiving").Bool()
-		if receiving {
-			return
+		notifyMsg := message{desc: "notifyMedia", content: msg}
+		for _, msgChan := range s.process {
+			go sendMessage(notifyMsg, msgChan)
 		}
-		log.Println("janusMessage: media receiving is false")
-		fallthrough
 	case "hangup":
 		hid := gjson.GetBytes(msg, "sender").Uint()
 		msg := message{desc: "notifyHangup", content: hid}
@@ -396,6 +404,9 @@ func (pub *publisher) messageHandle(msg message) bool {
 		}
 
 		log.Printf("publish: handle `%d` hangup", pub.hid)
+		fallthrough
+	case "notifyClose":
+		log.Printf("publish: close handle `%d`", pub.hid)
 		unpublish(s.janusConn, s.sid, pub.hid)
 		detach(s.janusConn, s.sid, pub.hid)
 
@@ -415,8 +426,37 @@ func (pub *publisher) messageHandle(msg message) bool {
 
 		rtclib.SendMsg(request)
 		return false
+	case "notifyMedia":
+		content := msg.content.([]byte)
+		sender := gjson.GetBytes(content, "sender").Uint()
+		if pub.hid != sender {
+			return true
+		}
+
+		receiving := gjson.GetBytes(content, "receiving").Bool()
+		if gjson.GetBytes(content, "type").String() == "video" {
+			pub.video = receiving
+		} else {
+			pub.audio = receiving
+		}
+
+		if !pub.video && !pub.audio {
+			go pub.mediaCheck()
+		}
 	}
 	return true
+}
+
+func (pub *publisher) mediaCheck() {
+	// Just set the media timeout 3 seconds
+	<-time.After(3 * time.Second)
+	if pub.video || pub.audio {
+		return
+	}
+
+	log.Printf("mediaCheck: close publisher `%d`", pub.hid)
+	s := pub.sess
+	s.notifyClose(pub.dialogueID)
 }
 
 func (s *session) publish(msgChan chan message, id string) {
@@ -541,6 +581,9 @@ func (l *listener) messageHandle(msg message) bool {
 		}
 
 		log.Printf("listen: handle `%d` hangup", l.hid)
+		fallthrough
+	case "notifyClose":
+		log.Printf("listen: close handle `%d`", l.hid)
 		detach(s.janusConn, s.sid, l.hid)
 
 		requestRawMsg := make(map[string]interface{})
@@ -581,8 +624,37 @@ func (l *listener) messageHandle(msg message) bool {
 			Body:       body,
 		}
 		rtclib.SendMsg(request)
+	case "notifyMedia":
+		content := msg.content.([]byte)
+		sender := gjson.GetBytes(content, "sender").Uint()
+		if l.hid != sender {
+			return true
+		}
+
+		receiving := gjson.GetBytes(content, "receiving").Bool()
+		if gjson.GetBytes(content, "type").String() == "video" {
+			l.video = receiving
+		} else {
+			l.audio = receiving
+		}
+
+		if !l.video && !l.audio {
+			go l.mediaCheck()
+		}
 	}
 	return true
+}
+
+func (l *listener) mediaCheck() {
+	// Just set the media timeout 3 seconds
+	<-time.After(3 * time.Second)
+	if l.video || l.audio {
+		return
+	}
+
+	log.Printf("mediaCheck: close listener `%d`", l.hid)
+	s := l.sess
+	s.notifyClose(l.dialogueID)
 }
 
 func (s *session) listen(msgChan chan message, id string, feed feed) {
@@ -761,5 +833,10 @@ func (s *session) registerPublisher(feed feed) {
 
 func (s *session) notifyQuit(id string) {
 	msg := message{desc: "notifyQuit", content: id}
+	go sendMessage(msg, s.msgChan)
+}
+
+func (s *session) notifyClose(id string) {
+	msg := message{desc: "notifyClose", content: id}
 	go sendMessage(msg, s.msgChan)
 }
