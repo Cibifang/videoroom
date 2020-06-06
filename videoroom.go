@@ -6,7 +6,7 @@ import (
 	"sync"
 
 	"github.com/go-ini/ini"
-	"github.com/go-redis/redis"
+	redis "gopkg.in/redis.v5"
 	"rtclib"
 )
 
